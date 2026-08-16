@@ -19,7 +19,6 @@ import vip.mate.troubleshooting.model.EvidenceStatus;
 import vip.mate.troubleshooting.model.IncidentContext;
 import vip.mate.troubleshooting.model.NorthStarTimings;
 import vip.mate.troubleshooting.service.StoredDiagnosis;
-import vip.mate.troubleshooting.service.TroubleshootingPersistenceService;
 import vip.mate.troubleshooting.statemachine.DiagnosisStateMachine;
 import vip.mate.troubleshooting.synthesis.DeterministicLogTraceCompressor;
 
@@ -71,15 +70,18 @@ public final class TroubleshootingAgentTriageService {
     private static final Set<String> REQUIRED_BINDINGS =
             Set.of(TroubleshootingEvidenceTool.BINDING_NAME);
     private static final Duration MAX_SYNC_TRIAGE_TIMEOUT = Duration.ofSeconds(25);
+    private static final Duration OPEN_DISCOVERY_CLAIM_LEASE =
+            MAX_SYNC_TRIAGE_TIMEOUT.plusSeconds(60);
     private static final ExecutorService AGENT_INVOCATION_EXECUTOR =
             Executors.newThreadPerTaskExecutor(
                     Thread.ofVirtual().name("troubleshooting-agent-budget-", 0).factory());
     private final TroubleshootingAgentProperties properties;
+    private final OpenDiscoveryAgentGate agentGate;
     private final AgentService agentService;
     private final AgentBindingService bindingService;
     private final TroubleshootingEvidenceSessionRegistry sessions;
     private final DiagnosisStateMachine stateMachine;
-    private final TroubleshootingPersistenceService persistence;
+    private final OpenDiscoveryDiagnosisPersistenceService openDiscoveryPersistence;
     private final ObjectMapper objectMapper;
     private final TroubleshootingEvidenceModelProjector modelEvidenceProjector;
     private final Clock clock;
@@ -88,16 +90,18 @@ public final class TroubleshootingAgentTriageService {
     @Autowired
     public TroubleshootingAgentTriageService(
             TroubleshootingAgentProperties properties,
+            OpenDiscoveryAgentGate agentGate,
             AgentService agentService,
             AgentBindingService bindingService,
             TroubleshootingEvidenceSessionRegistry sessions,
             DiagnosisStateMachine stateMachine,
-            TroubleshootingPersistenceService persistence,
+            OpenDiscoveryDiagnosisPersistenceService openDiscoveryPersistence,
             ObjectMapper objectMapper,
             TroubleshootingEvidenceModelProjector modelEvidenceProjector,
             ChatStreamTracker streamTracker) {
-        this(properties, agentService, bindingService, sessions, stateMachine,
-                persistence, objectMapper, modelEvidenceProjector, Clock.systemUTC(), streamTracker);
+        this(properties, agentGate, agentService, bindingService, sessions, stateMachine,
+                openDiscoveryPersistence, objectMapper, modelEvidenceProjector,
+                Clock.systemUTC(), streamTracker);
     }
 
     TroubleshootingAgentTriageService(
@@ -106,25 +110,18 @@ public final class TroubleshootingAgentTriageService {
             AgentBindingService bindingService,
             TroubleshootingEvidenceSessionRegistry sessions,
             DiagnosisStateMachine stateMachine,
-            TroubleshootingPersistenceService persistence,
-            ObjectMapper objectMapper,
-            Clock clock) {
-        this(properties, agentService, bindingService, sessions, stateMachine,
-                persistence, objectMapper, clock, null);
-    }
-
-    TroubleshootingAgentTriageService(
-            TroubleshootingAgentProperties properties,
-            AgentService agentService,
-            AgentBindingService bindingService,
-            TroubleshootingEvidenceSessionRegistry sessions,
-            DiagnosisStateMachine stateMachine,
-            TroubleshootingPersistenceService persistence,
+            OpenDiscoveryDiagnosisPersistenceService openDiscoveryPersistence,
             ObjectMapper objectMapper,
             Clock clock,
             ChatStreamTracker streamTracker) {
-        this(properties, agentService, bindingService, sessions, stateMachine,
-                persistence, objectMapper,
+        this(properties,
+                new OpenDiscoveryAgentGate(properties, agentService, bindingService),
+                agentService,
+                bindingService,
+                sessions,
+                stateMachine,
+                openDiscoveryPersistence,
+                objectMapper,
                 new TroubleshootingEvidenceModelProjector(
                         new DeterministicLogTraceCompressor()),
                 clock,
@@ -137,31 +134,43 @@ public final class TroubleshootingAgentTriageService {
             AgentBindingService bindingService,
             TroubleshootingEvidenceSessionRegistry sessions,
             DiagnosisStateMachine stateMachine,
-            TroubleshootingPersistenceService persistence,
+            OpenDiscoveryDiagnosisPersistenceService openDiscoveryPersistence,
             ObjectMapper objectMapper,
             TroubleshootingEvidenceModelProjector modelEvidenceProjector,
-            Clock clock) {
-        this(properties, agentService, bindingService, sessions, stateMachine,
-                persistence, objectMapper, modelEvidenceProjector, clock, null);
+            Clock clock,
+            ChatStreamTracker streamTracker) {
+        this(properties,
+                new OpenDiscoveryAgentGate(properties, agentService, bindingService),
+                agentService,
+                bindingService,
+                sessions,
+                stateMachine,
+                openDiscoveryPersistence,
+                objectMapper,
+                modelEvidenceProjector,
+                clock,
+                streamTracker);
     }
 
     TroubleshootingAgentTriageService(
             TroubleshootingAgentProperties properties,
+            OpenDiscoveryAgentGate agentGate,
             AgentService agentService,
             AgentBindingService bindingService,
             TroubleshootingEvidenceSessionRegistry sessions,
             DiagnosisStateMachine stateMachine,
-            TroubleshootingPersistenceService persistence,
+            OpenDiscoveryDiagnosisPersistenceService openDiscoveryPersistence,
             ObjectMapper objectMapper,
             TroubleshootingEvidenceModelProjector modelEvidenceProjector,
             Clock clock,
             ChatStreamTracker streamTracker) {
         this.properties = properties;
+        this.agentGate = agentGate;
         this.agentService = agentService;
         this.bindingService = bindingService;
         this.sessions = sessions;
         this.stateMachine = stateMachine;
-        this.persistence = persistence;
+        this.openDiscoveryPersistence = openDiscoveryPersistence;
         this.objectMapper = objectMapper;
         this.modelEvidenceProjector = modelEvidenceProjector;
         this.clock = clock;
@@ -240,196 +249,242 @@ public final class TroubleshootingAgentTriageService {
         if (workspaceId <= 0 || incident == null) {
             throw new IllegalArgumentException("workspaceId and incident are required");
         }
-        AgentEntity agent = requireSafeConfiguration(workspaceId);
         IncidentContext sanitizedIncident = TroubleshootingSecretRedactor.redact(incident);
         List<EvidenceResult> sanitizedSuppliedEvidence = suppliedEvidence == null
                 ? List.of()
                 : suppliedEvidence.stream()
                         .map(TroubleshootingSecretRedactor::redact)
                         .toList();
-        String correlationId = UUID.randomUUID().toString().replace("-", "");
-        String conversationId = "troubleshooting-triage-" + correlationId;
-        ChatOrigin origin = ChatOrigin.web(
-                conversationId, "troubleshooting-agent", workspaceId, null);
+        OpenDiscoveryRunReservation reservation = openDiscoveryPersistence.reserve(
+                workspaceId,
+                sanitizedIncident,
+                rehearsal,
+                reportedAt,
+                intakeSessionId,
+                OPEN_DISCOVERY_CLAIM_LEASE);
+        if (reservation.alreadyCompleted()) {
+            return reservation.completedDiagnosis();
+        }
+        try {
+            AgentEntity agent = requireSafeConfiguration(workspaceId);
+            List<String> visibleScenarioKeys =
+                    sessions.approvedScenarioKeys(workspaceId, sanitizedIncident);
+            String correlationId = UUID.randomUUID().toString().replace("-", "");
+            String conversationId = "troubleshooting-triage-" + correlationId;
+            ChatOrigin origin = ChatOrigin.web(
+                    conversationId, "troubleshooting-agent", workspaceId, null);
 
-        String modelOutput = null;
-        boolean agentFailed = false;
-        boolean agentTimedOut = false;
-        PromptEnvelope prompt;
-        TroubleshootingEvidenceSessionRegistry.SessionSnapshot snapshot;
-        try (TroubleshootingEvidenceSessionRegistry.SessionHandle session =
-                     sessions.open(
-                             conversationId,
-                             workspaceId,
-                             sanitizedIncident,
-                             sanitizedSuppliedEvidence)) {
-            // The registry owns canonical evidence IDs. Build the prompt from
-            // its initial snapshot so dangerous supplied queryIds are already
-            // remapped exactly as they will later be persisted in Diagnosis.
-            prompt = prompt(
-                    workspaceId,
-                    sanitizedIncident,
-                    session.snapshot().evidence(),
-                    routeMissReason);
-            try {
-                modelOutput = invokeAgentWithinBudget(
-                        agent.getId(), prompt.text(), conversationId, origin);
-            } catch (AgentInvocationTimeoutException timeout) {
-                agentTimedOut = true;
-                agentFailed = true;
-            } catch (AgentInvocationInterruptedException interrupted) {
-                throw interrupted;
-            } catch (MateClawException failure) {
-                if (failure.getMsgKey() != null
-                        && failure.getMsgKey().startsWith("err.agent.hard_scope_")) {
-                    throw configurationConflict(failure.getMessage());
+            String modelOutput = null;
+            boolean agentFailed = false;
+            boolean agentTimedOut = false;
+            Instant discoveryStartedAt = clock.instant();
+            Instant evidenceDeadline = Instant.now().plus(properties.getTriageTimeout());
+            PromptEnvelope prompt;
+            TroubleshootingEvidenceSessionRegistry.SessionSnapshot snapshot;
+            try (TroubleshootingEvidenceSessionRegistry.SessionHandle session =
+                         sessions.open(
+                                 conversationId,
+                                 workspaceId,
+                                 sanitizedIncident,
+                                 sanitizedSuppliedEvidence,
+                                 evidenceDeadline)) {
+                // The registry owns canonical evidence IDs. Build the prompt from
+                // its initial snapshot so dangerous supplied queryIds are already
+                // remapped exactly as they will later be persisted in Diagnosis.
+                prompt = prompt(
+                        visibleScenarioKeys,
+                        sanitizedIncident,
+                        session.snapshot().evidence(),
+                        routeMissReason);
+                try {
+                    modelOutput = invokeAgentWithinBudget(
+                            agent.getId(),
+                            prompt.text(),
+                            conversationId,
+                            origin,
+                            evidenceDeadline);
+                } catch (AgentInvocationTimeoutException timeout) {
+                    agentTimedOut = true;
+                    agentFailed = true;
+                } catch (AgentInvocationInterruptedException interrupted) {
+                    throw interrupted;
+                } catch (MateClawException failure) {
+                    if (failure.getMsgKey() != null
+                            && failure.getMsgKey().startsWith("err.agent.hard_scope_")) {
+                        throw configurationConflict(failure.getMessage());
+                    }
+                    agentFailed = true;
+                } catch (RuntimeException failure) {
+                    agentFailed = true;
                 }
-                agentFailed = true;
-            } catch (RuntimeException failure) {
-                agentFailed = true;
+                snapshot = session.snapshot();
             }
-            snapshot = session.snapshot();
-        }
 
-        List<String> warnings = new ArrayList<>();
-        warnings.add("只读 Agent 输出仅供人工确认；未生成或执行任何处置动作。");
-        warnings.add("当前证据链仍处于 fixtureMode，生产数据源联调完成前不得解除。");
-        if (prompt.truncated()) {
-            warnings.add("未受信上下文超出 " + properties.getMaxPromptChars()
-                    + " 字符的上下文预算，已确定性截断；结论仍需人工复核。");
-        }
-        if (routeMissReason != null && !routeMissReason.isBlank()) {
-            warnings.add("确定性路由未命中："
-                    + TroubleshootingSecretRedactor.redact(routeMissReason));
-        }
+            List<String> warnings = new ArrayList<>();
+            warnings.add("上面的分析只是建议，需要人确认；系统没有自动改任何东西。");
+            warnings.add("当前还在演练/演示证据模式；生产数据源联调完成前，不能当成正式验收通过。");
+            if (prompt.truncated()) {
+                warnings.add("未受信上下文超出 " + properties.getMaxPromptChars()
+                        + " 字符的上下文预算，已确定性截断；结论仍需人工复核。");
+            }
+            if (routeMissReason != null && !routeMissReason.isBlank()) {
+                warnings.add(plainRouteMissWarning(routeMissReason));
+            }
 
-        AgentResponse response = agentFailed ? null : parse(modelOutput);
-        if (response == null) {
-            if (agentTimedOut) {
-                warnings.add("只读 Agent 超出 " + properties.getTriageTimeout().toSeconds()
-                        + " 秒服务端时长预算，已停止等待并降级为人工深查。");
+            AgentResponse response = agentFailed ? null : parse(modelOutput);
+            if (response == null) {
+                if (agentTimedOut) {
+                    warnings.add("助手超时（超过 " + properties.getTriageTimeout().toSeconds()
+                            + " 秒），已改为请人继续查。");
+                } else {
+                    warnings.add(agentFailed
+                            ? "助手调用失败，已改为请人继续查。"
+                            : "助手返回内容读不懂，已改为请人继续查。");
+                }
+            }
+            if (snapshot.coreEvidenceFailure() != null) {
+                warnings.add("在线核心证据链不完整（"
+                        + snapshot.coreEvidenceFailure()
+                        + "），已强制弃权并转人工深查。");
+            }
+            List<String> citations = verifiedCitations(response, snapshot);
+            boolean blankCore = response == null
+                    || response.summary() == null || response.summary().isBlank()
+                    || response.hypothesis() == null || response.hypothesis().isBlank();
+            boolean forcedAbstention = response == null
+                    || Boolean.TRUE.equals(response.abstain())
+                    || response.confidence() == Confidence.LOW
+                    || citations.isEmpty()
+                    || blankCore
+                    || snapshot.coreEvidenceFailure() != null;
+            if (response != null && !Boolean.TRUE.equals(response.abstain())
+                    && citations.isEmpty()) {
+                warnings.add("助手没给出可核对的证据引用，已放弃自动结论。");
+            }
+            if (response != null && !Boolean.TRUE.equals(response.abstain()) && blankCore) {
+                warnings.add("助手没写清摘要和假设，已放弃自动结论。");
+            }
+
+            String summary = response == null || response.summary() == null
+                    || response.summary().isBlank()
+                    ? "助手没形成可核对结论，等人工继续查。"
+                    : TroubleshootingSecretRedactor.redact(response.summary().trim());
+            String hypothesis = response == null || response.hypothesis() == null
+                    || response.hypothesis().isBlank()
+                    ? "证据不足，暂不能确认根因。"
+                    : TroubleshootingSecretRedactor.redact(response.hypothesis().trim());
+            Confidence confidence;
+            if (forcedAbstention) {
+                confidence = Confidence.LOW;
+            } else if (response.confidence() == Confidence.HIGH) {
+                confidence = Confidence.MEDIUM;
+                warnings.add("开放调查建议最高按中等把握看待，仍需人工确认。");
             } else {
-                warnings.add(agentFailed
-                        ? "只读 Agent 调用失败，已降级为人工深查。"
-                        : "只读 Agent 输出不可解析，已降级为人工深查。");
+                confidence = response.confidence();
             }
+
+            Instant discoveryCompletedAt = clock.instant();
+            AgentTriageDraft draft = new AgentTriageDraft(
+                    "diag-" + correlationId,
+                    "case-" + correlationId,
+                    "run-" + correlationId,
+                    sanitizedIncident,
+                    snapshot.evidence(),
+                    citations,
+                    summary,
+                    hypothesis,
+                    confidence,
+                    forcedAbstention,
+                    NorthStarTimings.concluded(reportedAt, readyAt, discoveryCompletedAt),
+                    rehearsal,
+                    // 从这批证据自己身上读。第二个参数不能省：会话快照里既有 Agent
+                    // 自己通过取证脊柱取回来的，也有**调用方随请求自带的**，而后者的
+                    // `source` 是它自己写上去的——写成 "guance" 就能让整条诊断自称真源。
+                    EvidenceProvenance.fixtureMode(
+                            snapshot.evidence(), sanitizedSuppliedEvidence),
+                    warnings);
+            Diagnosis diagnosis = stateMachine.initializeAgentFallback(draft);
+            OpenDiscoveryRunAudit runAudit = new OpenDiscoveryRunAudit(
+                    diagnosis.runId(),
+                    diagnosis.diagnosisId(),
+                    visibleScenarioKeys,
+                    snapshot.selectedScenarioKey(),
+                    snapshot.selectedPlanFingerprint(),
+                    snapshot.plannedSignalKinds(),
+                    agent.getMaxIterations(),
+                    properties.getMaxEvidenceRequests(),
+                    snapshot.sourceRequestCount(),
+                    properties.getTriageTimeout(),
+                    stopReason(
+                            response,
+                            agentFailed,
+                            agentTimedOut,
+                            blankCore,
+                            citations,
+                            snapshot),
+                    snapshot.evidence().stream()
+                            .map(EvidenceResult::queryId)
+                            .filter(snapshot.toolCollectedQueryIds()::contains)
+                            .toList(),
+                    discoveryStartedAt,
+                    discoveryCompletedAt,
+                    "agent:" + agent.getId());
+            return openDiscoveryPersistence.persist(
+                    workspaceId,
+                    diagnosis,
+                    reportedAt,
+                    intakeSessionId,
+                    reservation.claim(),
+                    runAudit);
+        } catch (RuntimeException | Error failure) {
+            openDiscoveryPersistence.release(workspaceId, reservation.claim());
+            throw failure;
+        }
+    }
+
+    private OpenDiscoveryRunAudit.StopReason stopReason(
+            AgentResponse response,
+            boolean agentFailed,
+            boolean agentTimedOut,
+            boolean blankCore,
+            List<String> citations,
+            TroubleshootingEvidenceSessionRegistry.SessionSnapshot snapshot) {
+        if (agentTimedOut) {
+            return OpenDiscoveryRunAudit.StopReason.TIME_BUDGET_EXHAUSTED;
+        }
+        if (agentFailed) {
+            return OpenDiscoveryRunAudit.StopReason.AGENT_INVOCATION_FAILED;
+        }
+        if (response == null || blankCore) {
+            return OpenDiscoveryRunAudit.StopReason.INVALID_AGENT_OUTPUT;
         }
         if (snapshot.coreEvidenceFailure() != null) {
-            warnings.add("在线核心证据链不完整（"
-                    + snapshot.coreEvidenceFailure()
-                    + "），已强制弃权并转人工深查。");
+            return OpenDiscoveryRunAudit.StopReason.CORE_EVIDENCE_INCOMPLETE;
         }
-        List<String> citations = verifiedCitations(response, snapshot);
-        boolean blankCore = response == null
-                || response.summary() == null || response.summary().isBlank()
-                || response.hypothesis() == null || response.hypothesis().isBlank();
-        boolean forcedAbstention = response == null
-                || Boolean.TRUE.equals(response.abstain())
-                || response.confidence() == Confidence.LOW
-                || citations.isEmpty()
-                || blankCore
-                || snapshot.coreEvidenceFailure() != null;
-        if (response != null && !Boolean.TRUE.equals(response.abstain())
-                && citations.isEmpty()) {
-            warnings.add("只读 Agent 未提供可验证的证据引用，已强制弃权。");
+        if (Boolean.TRUE.equals(response.abstain())
+                || response.confidence() == Confidence.LOW) {
+            return OpenDiscoveryRunAudit.StopReason.AGENT_ABSTAINED;
         }
-        if (response != null && !Boolean.TRUE.equals(response.abstain()) && blankCore) {
-            warnings.add("只读 Agent 未提供完整的摘要与假设，已强制弃权。");
+        if (citations.isEmpty()) {
+            return OpenDiscoveryRunAudit.StopReason.NO_VERIFIABLE_CITATIONS;
         }
-
-        String summary = response == null || response.summary() == null
-                || response.summary().isBlank()
-                ? "只读 Agent 未能形成可验证结论，等待人工深查。"
-                : TroubleshootingSecretRedactor.redact(response.summary().trim());
-        String hypothesis = response == null || response.hypothesis() == null
-                || response.hypothesis().isBlank()
-                ? "证据不足，暂不能确认根因。"
-                : TroubleshootingSecretRedactor.redact(response.hypothesis().trim());
-        Confidence confidence;
-        if (forcedAbstention) {
-            confidence = Confidence.LOW;
-        } else if (response.confidence() == Confidence.HIGH) {
-            confidence = Confidence.MEDIUM;
-            warnings.add("未命中路 Agent 建议最高校准为 MEDIUM，仍需人工确认。");
-        } else {
-            confidence = response.confidence();
-        }
-
-        AgentTriageDraft draft = new AgentTriageDraft(
-                "diag-" + correlationId,
-                "case-" + correlationId,
-                "run-" + correlationId,
-                sanitizedIncident,
-                snapshot.evidence(),
-                citations,
-                summary,
-                hypothesis,
-                confidence,
-                forcedAbstention,
-                NorthStarTimings.concluded(reportedAt, readyAt, clock.instant()),
-                rehearsal,
-                // 从这批证据自己身上读。第二个参数不能省：会话快照里既有 Agent
-                // 自己通过取证脊柱取回来的，也有**调用方随请求自带的**，而后者的
-                // `source` 是它自己写上去的——写成 "guance" 就能让整条诊断自称真源。
-                EvidenceProvenance.fixtureMode(
-                        snapshot.evidence(), sanitizedSuppliedEvidence),
-                warnings);
-        Diagnosis diagnosis = stateMachine.initializeAgentFallback(draft);
-        return intakeSessionId == null
-                ? persistence.createOrGet(workspaceId, diagnosis, reportedAt)
-                : persistence.createOrGetForIntake(
-                        workspaceId, diagnosis, intakeSessionId);
+        return OpenDiscoveryRunAudit.StopReason.VERIFIABLE_HYPOTHESIS;
     }
 
     private AgentEntity requireSafeConfiguration(long workspaceId) {
-        if (!properties.isEnabled()) {
-            throw configurationConflict("troubleshooting miss-path Agent is disabled");
-        }
-        if (properties.getAgentId() <= 0
-                || properties.getMaxIterations() <= 0
-                || properties.getMaxEvidenceRequests() < 3
-                || properties.getMaxPromptChars() < MIN_PROMPT_CHARS
-                || properties.getTriageTimeout() == null
-                || properties.getTriageTimeout().toMillis() <= 0
-                || properties.getTriageTimeout().compareTo(MAX_SYNC_TRIAGE_TIMEOUT) > 0) {
-            throw configurationConflict("troubleshooting Agent limits are not configured");
-        }
-
-        AgentEntity agent;
-        try {
-            agent = agentService.getAgent(properties.getAgentId());
-        } catch (RuntimeException unavailable) {
-            throw configurationConflict("configured troubleshooting Agent is unavailable");
-        }
-        if (!Boolean.TRUE.equals(agent.getEnabled())
-                || agent.getWorkspaceId() == null
-                || agent.getWorkspaceId() != workspaceId
-                || !"react".equalsIgnoreCase(agent.getAgentType())
-                || agent.getModelName() == null
-                || agent.getModelName().isBlank()
-                || !Boolean.TRUE.equals(agent.getSkillsDisabled())
-                || !Boolean.TRUE.equals(agent.getWikiDisabled())
-                || Boolean.TRUE.equals(agent.getToolsDisabled())
-                || agent.getMaxIterations() == null
-                || agent.getMaxIterations() <= 0
-                || agent.getMaxIterations() > properties.getMaxIterations()) {
-            throw configurationConflict(
-                    "troubleshooting Agent must be enabled, workspace-local, ReAct, "
-                            + "explicitly model-pinned, skill/wiki-disabled, and iteration-bounded");
-        }
-        Set<String> bindings = bindingService.getBoundToolNames(agent.getId());
-        if (!REQUIRED_BINDINGS.equals(bindings)) {
-            throw configurationConflict(
-                    "troubleshooting Agent requires exactly one read-only tool binding");
-        }
-        return agent;
+        return agentGate.requireReadyAgent(workspaceId);
     }
 
     private String invokeAgentWithinBudget(
             long agentId,
             String prompt,
             String conversationId,
-            ChatOrigin origin) {
+            ChatOrigin origin,
+            Instant deadline) {
+        long remainingNanos = Duration.between(Instant.now(), deadline).toNanos();
+        if (remainingNanos <= 0) {
+            throw new AgentInvocationTimeoutException();
+        }
         if (streamTracker != null) {
             streamTracker.register(conversationId);
         }
@@ -437,8 +492,7 @@ public final class TroubleshootingAgentTriageService {
                 agentService.chatWithToolAllowlist(
                         agentId, prompt, conversationId, origin, HARD_TOOL_SCOPE));
         try {
-            return invocation.get(
-                    properties.getTriageTimeout().toMillis(), TimeUnit.MILLISECONDS);
+            return invocation.get(remainingNanos, TimeUnit.NANOSECONDS);
         } catch (TimeoutException timeout) {
             stopInvocation(conversationId, invocation);
             throw new AgentInvocationTimeoutException();
@@ -463,6 +517,7 @@ public final class TroubleshootingAgentTriageService {
     }
 
     private void stopInvocation(String conversationId, Future<String> invocation) {
+        sessions.cancel(conversationId);
         if (streamTracker != null) {
             streamTracker.requestStop(conversationId);
         }
@@ -470,12 +525,11 @@ public final class TroubleshootingAgentTriageService {
     }
 
     private PromptEnvelope prompt(
-            long workspaceId,
+            List<String> visibleScenarioKeys,
             IncidentContext incident,
             List<EvidenceResult> suppliedEvidence,
             String routeMissReason) {
-        String approvedScenarioKeys = json(
-                sessions.approvedScenarioKeys(workspaceId, incident));
+        String approvedScenarioKeys = json(visibleScenarioKeys);
         String incidentJson = untrustedPromptData(json(
                 TroubleshootingSecretRedactor.redact(incident)));
         String evidenceJson = untrustedPromptData(json(
@@ -570,6 +624,14 @@ public final class TroubleshootingAgentTriageService {
             }
         }
         return List.copyOf(seen);
+    }
+
+    private static String plainRouteMissWarning(String routeMissReason) {
+        String reason = TroubleshootingSecretRedactor.redact(routeMissReason).trim();
+        if (reason.contains("no errorCode") || reason.contains("deterministic routing needs one")) {
+            return "这单没有错误码，没法自动匹配标准排障方案。";
+        }
+        return "没法自动匹配标准排障方案：" + reason;
     }
 
     private String json(Object value) {

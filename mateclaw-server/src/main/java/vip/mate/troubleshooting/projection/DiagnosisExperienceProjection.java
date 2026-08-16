@@ -54,7 +54,15 @@ public record DiagnosisExperienceProjection(
             String diagnosisId,
             ConclusionType conclusionType,
             String headline,
+            // The one thing the reader came for. It is a field rather than a
+            // sentence inside narrative because a reader who stops after two
+            // lines should still have the answer.
+            String rootCause,
             String narrative,
+            // The counts that make the conclusion checkable rather than
+            // something the reader has to take on faith. Plain language, no
+            // query text: aggregate counts are business facts, DQL is not.
+            String keyEvidence,
             Confidence confidence,
             String problem,
             ImpactView impact,
@@ -68,10 +76,18 @@ public record DiagnosisExperienceProjection(
             headline = required(headline, "headline");
             narrative = required(narrative, "narrative");
             problem = required(problem, "problem");
+            rootCause = normalizeNullable(rootCause);
+            keyEvidence = normalizeNullable(keyEvidence);
             if (conclusionType == null || confidence == null || impact == null
                     || nextStep == null || status == null || timings == null) {
                 throw new IllegalArgumentException(
                         "conclusionType, confidence, impact, nextStep, status and timings are required");
+            }
+            // An abstention that still names a cause is the failure mode the
+            // whole abstain path exists to prevent.
+            if (conclusionType == ConclusionType.INSUFFICIENT_EVIDENCE && rootCause != null) {
+                throw new IllegalArgumentException(
+                        "INSUFFICIENT_EVIDENCE conclusions must not name a root cause");
             }
             if (conclusionType == ConclusionType.EXCLUDED && confidence == Confidence.HIGH) {
                 throw new IllegalArgumentException("EXCLUDED conclusions cannot have HIGH confidence");
@@ -316,24 +332,48 @@ public record DiagnosisExperienceProjection(
         }
     }
 
+    public record ComparisonGroupView(
+            long totalRequests,
+            long requestsWithFeature) {
+
+        public ComparisonGroupView {
+            if (totalRequests <= 0) {
+                throw new IllegalArgumentException("totalRequests must be positive");
+            }
+            if (requestsWithFeature < 0 || requestsWithFeature > totalRequests) {
+                throw new IllegalArgumentException(
+                        "requestsWithFeature must be between zero and totalRequests");
+            }
+        }
+    }
+
     public record ContrastView(
             boolean available,
-            String failedSample,
-            String baselineSample,
+            String featureCode,
+            ComparisonGroupView failedRequests,
+            ComparisonGroupView normalRequests,
             String note,
             List<String> evidenceRefs) {
 
         public ContrastView {
-            failedSample = normalizeNullable(failedSample);
-            baselineSample = normalizeNullable(baselineSample);
+            featureCode = normalizeNullable(featureCode);
             note = note == null ? "" : note.trim();
             evidenceRefs = List.copyOf(evidenceRefs == null ? List.of() : evidenceRefs);
-            if (available && (blank(failedSample) || blank(baselineSample) || evidenceRefs.isEmpty())) {
+            if (available && (blank(featureCode)
+                    || failedRequests == null
+                    || normalRequests == null
+                    || evidenceRefs.isEmpty())) {
                 throw new IllegalArgumentException(
-                        "available contrast requires both samples and evidenceRefs");
+                        "available contrast requires a feature, both request groups and evidenceRefs");
             }
             if (!available && blank(note)) {
                 throw new IllegalArgumentException("unavailable contrast requires a note");
+            }
+            if (!available && (!blank(featureCode)
+                    || failedRequests != null
+                    || normalRequests != null)) {
+                throw new IllegalArgumentException(
+                        "unavailable contrast must not carry comparison facts");
             }
         }
     }

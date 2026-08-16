@@ -4,6 +4,8 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -18,6 +20,7 @@ import vip.mate.troubleshooting.model.RouteSemanticsProvenance;
 import vip.mate.troubleshooting.model.ScenarioSelector;
 import vip.mate.troubleshooting.model.TroubleshootingDiagnosisEntity;
 import vip.mate.troubleshooting.model.TroubleshootingKnowledgeOutboxEntity;
+import vip.mate.troubleshooting.pilot.TroubleshootingPilotPlanService;
 import vip.mate.troubleshooting.repository.TroubleshootingDiagnosisMapper;
 import vip.mate.troubleshooting.repository.TroubleshootingKnowledgeOutboxMapper;
 
@@ -33,17 +36,22 @@ import java.util.Optional;
 @Service
 public class TroubleshootingPersistenceService {
 
+    private static final Logger log = LoggerFactory.getLogger(TroubleshootingPersistenceService.class);
+
     private final TroubleshootingDiagnosisMapper diagnosisMapper;
     private final TroubleshootingKnowledgeOutboxMapper outboxMapper;
     private final ObjectMapper objectMapper;
+    private final TroubleshootingPilotPlanService pilotPlans;
 
     public TroubleshootingPersistenceService(
             TroubleshootingDiagnosisMapper diagnosisMapper,
             TroubleshootingKnowledgeOutboxMapper outboxMapper,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            TroubleshootingPilotPlanService pilotPlans) {
         this.diagnosisMapper = diagnosisMapper;
         this.outboxMapper = outboxMapper;
         this.objectMapper = objectMapper;
+        this.pilotPlans = pilotPlans;
     }
 
     @Transactional
@@ -198,6 +206,18 @@ public class TroubleshootingPersistenceService {
                 .map(entity -> stored(entity, false));
     }
 
+    /** Finds a generic five-minute incident bucket before any external work starts. */
+    public Optional<StoredDiagnosis> findByIncident(
+            long workspaceId,
+            vip.mate.troubleshooting.model.IncidentContext incident,
+            boolean rehearsal,
+            Instant receivedAt) {
+        validateWorkspace(workspaceId);
+        return IncidentDeduplicationKey.create(incident, rehearsal, receivedAt)
+                .map(key -> findByDedupKey(workspaceId, key))
+                .map(entity -> stored(entity, false));
+    }
+
     @Transactional
     public StoredDiagnosis update(long workspaceId, Diagnosis diagnosis, int expectedVersion) {
         updateAggregate(workspaceId, diagnosis, expectedVersion);
@@ -231,16 +251,24 @@ public class TroubleshootingPersistenceService {
             query.eq(TroubleshootingDiagnosisEntity::getStatus, status.trim());
         }
         if (system != null && !system.isBlank()) {
-            query.eq(TroubleshootingDiagnosisEntity::getSystem, system.trim());
+            query.eq(TroubleshootingDiagnosisEntity::getSystemName, system.trim());
         }
         if (investigationMode != null) {
             query.eq(
                     TroubleshootingDiagnosisEntity::getInvestigationMode,
                     investigationMode.name());
         }
-        return diagnosisMapper.selectList(query).stream()
-                .map(DiagnosisSummary::from)
-                .toList();
+        java.util.List<DiagnosisSummary> rows = new java.util.ArrayList<>();
+        for (TroubleshootingDiagnosisEntity entity : diagnosisMapper.selectList(query)) {
+            try {
+                rows.add(DiagnosisSummary.from(entity));
+            } catch (RuntimeException failure) {
+                // One corrupt legacy/indexed row must not blank the duty queue.
+                log.warn("Skipping diagnosis {} in queue: {}",
+                        entity.getDiagnosisId(), failure.toString());
+            }
+        }
+        return rows;
     }
 
     @Transactional
@@ -433,6 +461,11 @@ public class TroubleshootingPersistenceService {
         entity.setAggregateJson(json(diagnosis));
         entity.setInvestigationMode(persistedInvestigationMode(diagnosis));
         entity.setRouteAuthority(persistedRouteAuthority(diagnosis));
+        entity.setPilotPlanVersion(pilotPlans.enrollmentVersion(
+                workspaceId,
+                diagnosis.incident().system(),
+                diagnosis.incident().service(),
+                diagnosis.rehearsal()));
         entity.setVersion(0);
         entity.setDeleted(0);
         entity.setCreateTime(now);

@@ -64,6 +64,12 @@ class TroubleshootingPlaybookVersionMapperIntegrationTest {
             executeMigration(
                     connection,
                     "db/migration/h2/V190__troubleshooting_knowledge_evidence_grade.sql");
+            try (Statement statement = connection.createStatement()) {
+                statement.executeUpdate("""
+                        ALTER TABLE mate_troubleshooting_playbook_version
+                        RENAME COLUMN system TO system_name
+                        """);
+            }
         }
 
         MybatisConfiguration configuration = new MybatisConfiguration();
@@ -104,6 +110,12 @@ class TroubleshootingPlaybookVersionMapperIntegrationTest {
                 .singleElement()
                 .extracting("playbookId")
                 .isEqualTo("playbook-1");
+        assertThat(mapper.listActiveSystemsForExactRoute(
+                7L, "order-svc", "903001"))
+                .containsExactly("CSDP");
+        assertThat(mapper.listActiveSystemsForExactRoute(
+                8L, "order-svc", "903001"))
+                .isEmpty();
         assertThat(mapper.listUnverifiedKnowledgeEvidenceGradesAfter(0L, 10))
                 .singleElement()
                 .extracting("playbookId")

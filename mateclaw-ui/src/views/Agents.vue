@@ -135,6 +135,17 @@
                   <input type="checkbox" :checked="agent.enabled" @change="toggleAgent(agent)" />
                   <span class="toggle-slider"></span>
                 </label>
+                <button
+                  class="action-btn"
+                  :class="{ 'action-btn--bound': String(tsBoundAgentId) === String(agent.id) }"
+                  title="设为排障开放调查员工"
+                  @click="bindAsOpenDiscoveryAgent(agent)"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="3"/>
+                    <path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>
+                  </svg>
+                </button>
                 <button class="action-btn" :title="t('agents.tabs.context')" @click="goToAgentContextFor(agent)">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
@@ -723,11 +734,12 @@ import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { mcToast } from '@/composables/useMcToast'
 import { mcConfirm } from '@/components/common/useConfirm'
-import { agentApi, agentBindingApi, modelApi, skillApi, toolApi, templateApi, liveApi, wikiApi } from '@/api/index'
+import { agentApi, agentBindingApi, modelApi, skillApi, toolApi, templateApi, liveApi, wikiApi, troubleshootingApi } from '@/api/index'
 import type { Agent } from '@/types/index'
 import SkillIcon from '@/components/common/SkillIcon.vue'
 import SkillIconPicker from '@/components/common/SkillIconPicker.vue'
 import LivePanel from '@/components/live/LivePanel.vue'
+import { parseAgentsLiveRoute, type AgentsView } from '@/composables/agentsLiveRouteState'
 import PlanBoard from '@/components/agents/PlanBoard.vue'
 import AgentGuideEditor from './Agents/components/AgentGuideEditor.vue'
 import {
@@ -748,6 +760,7 @@ const route = useRoute()
 const { t } = useI18n()
 const { resolveSkillName } = useSkillName()
 const agents = ref<Agent[]>([])
+const tsBoundAgentId = ref<string | number | null>(null)
 const searchText = ref('')
 const activeFilter = ref('all')
 // Tag filter (#146) — orthogonal to activeFilter; multi-select with AND
@@ -1159,7 +1172,7 @@ const filteredAgents = computed(() => {
 // Roster ↔ Live view switch — admin only. The running/stuck counts feed the
 // segmented control's pulse + badge so you know whether Live is worth a look.
 const isAdminRole = computed(() => (localStorage.getItem('role') || 'user') === 'admin')
-type AgentView = 'roster' | 'live' | 'plans'
+type AgentView = AgentsView
 const view = ref<AgentView>(
   isAdminRole.value && (route.query.view === 'live' || route.query.view === 'plans')
     ? (route.query.view as AgentView)
@@ -1173,6 +1186,13 @@ function setView(next: AgentView) {
   view.value = next
   router.replace({ query: next === 'roster' ? {} : { view: next } })
 }
+
+watch(
+  () => [route.query.view, route.query.teamRunId, route.query.taskId] as const,
+  () => {
+    view.value = isAdminRole.value ? parseAgentsLiveRoute(route.query).view : 'roster'
+  },
+)
 
 async function refreshLiveCounts() {
   if (!isAdminRole.value) return
@@ -1188,6 +1208,7 @@ async function refreshLiveCounts() {
 
 onMounted(() => {
   loadAgents()
+  loadOpenDiscoveryBinding()
   // RFC-03 G1: load models once for the per-Agent override dropdown.
   // Failure is non-fatal — the dropdown just shows only "global default".
   loadAvailableModels()
@@ -1207,6 +1228,54 @@ async function loadAgents() {
     agents.value = res.data || []
   } catch {
     mcToast.error(t('agents.messages.loadFailed'))
+  }
+}
+
+async function loadOpenDiscoveryBinding() {
+  try {
+    const { data } = await troubleshootingApi.openDiscoveryAgentBinding()
+    tsBoundAgentId.value = data?.source === 'WORKSPACE' && data.agentId
+      ? data.agentId
+      : null
+  } catch {
+    tsBoundAgentId.value = null
+  }
+}
+
+async function bindAsOpenDiscoveryAgent(agent: Agent) {
+  const ok = await mcConfirm({
+    title: '设为排障开放调查员工',
+    message:
+      `将「${agent.name}」绑定为本工作区 OPEN_DISCOVERY 专用数字员工。` +
+      `会把其工具收敛为 TroubleshootingEvidenceTool；需已关闭 Skills/Wiki、ReAct、显式模型。`,
+    tone: 'default',
+  })
+  if (!ok) return
+  try {
+    // Soft-prepare agent flags commonly required by the gate.
+    await agentApi.update(agent.id, {
+      ...agent,
+      agentType: 'react',
+      skillsDisabled: true,
+      wikiDisabled: true,
+      toolsDisabled: false,
+      enabled: true,
+    })
+    const { data } = await troubleshootingApi.bindOpenDiscoveryAgent({
+      agentId: agent.id,
+      prepareEvidenceTool: true,
+    })
+    tsBoundAgentId.value = data.agentId
+    if (data.ready) {
+      mcToast.success(`已绑定「${agent.name}」为排障开放调查员工`)
+    } else {
+      mcToast.error(
+        data.blockers?.[0] || '已写入绑定，但仍有配置缺口，请看开放调查就绪检查',
+      )
+    }
+    await loadAgents()
+  } catch (e: any) {
+    mcToast.error(e?.message || '绑定失败')
   }
 }
 
@@ -1365,7 +1434,9 @@ async function openEditModal(agent: Agent) {
       // tool grouped by server, with stale/available flags so the picker
       // matches the runtime callback set exactly.
       toolApi.listAvailable(),
-      modelApi.listProviders(),
+      // Options, not the full provider list: /models is admin-only, and a
+      // workspace member editing an agent would 403 and fail this whole batch.
+      modelApi.listProviderOptions(),
       agentBindingApi.listSkills(agent.id),
       agentBindingApi.listTools(agent.id),
       agentBindingApi.listProviderPreferences(agent.id),
@@ -1373,9 +1444,9 @@ async function openEditModal(agent: Agent) {
     availableSkills.value = (skillsRes as any).data || []
     availableTools.value = (toolsRes as any).data || []
     // Pool of providers the user has actually configured — no point letting an
-    // agent prefer a provider that doesn't exist on this deployment.
+    // agent prefer a provider that doesn't exist on this deployment. The
+    // options endpoint already drops unconfigured rows.
     availableProviders.value = ((providersRes as any).data || [])
-      .filter((p: any) => p.configured)
       .map((p: any) => ({ id: p.id, name: p.name }))
     selectedSkillIds.value = ((boundSkillsRes as any).data || [])
       .filter((b: any) => b.enabled)
@@ -1794,6 +1865,7 @@ html.dark .seg-count.warn {
 
 .action-btns { display: flex; gap: 4px; }
 .action-btn { width: 30px; height: 30px; border: 1px solid var(--mc-border); background: var(--mc-bg-elevated); border-radius: 6px; display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--mc-text-secondary); transition: all 0.15s; }
+.action-btn--bound { border-color: var(--mc-accent, #2563eb); color: var(--mc-accent, #2563eb); background: color-mix(in srgb, var(--mc-accent, #2563eb) 12%, transparent); }
 .action-btn:hover { background: var(--mc-bg-sunken); color: var(--mc-text-primary); }
 .action-btn.danger:hover { background: var(--mc-danger-bg); border-color: var(--mc-danger); color: var(--mc-danger); }
 

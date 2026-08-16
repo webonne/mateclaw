@@ -11,6 +11,7 @@ export interface FormalIncidentForm {
   severity: IncidentSeverity
   errorCode: string
   traceId: string
+  occurredAt: string
   rehearsal: boolean
 }
 
@@ -29,6 +30,7 @@ export const EMPTY_FORMAL_INCIDENT: FormalIncidentForm = {
   severity: 'P2',
   errorCode: '',
   traceId: '',
+  occurredAt: '',
   rehearsal: true,
 }
 
@@ -40,6 +42,7 @@ const ACCESS_LOG_BODY = /^\s*\S+\s+\S+\s+\S+\s+\[[^\n]{1,128}\]\s+"(?:GET|POST|P
 const SAFE_TRACE_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/
 const MAX_IDENTIFIER_LENGTH = 128
 const MAX_TITLE_LENGTH = 500
+const ISO_OCCURRED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/
 
 function clean(value: string) {
   return value.trim()
@@ -62,6 +65,15 @@ export function formalIncidentFormErrors(form: FormalIncidentForm) {
   if (clean(form.service).length > MAX_IDENTIFIER_LENGTH) errors.push('故障服务最多 128 个字符')
   if (clean(form.title).length > MAX_TITLE_LENGTH) errors.push('故障现象最多 500 个字符')
   if (clean(form.errorCode).length > MAX_IDENTIFIER_LENGTH) errors.push('错误码最多 128 个字符')
+  const occurredAt = clean(form.occurredAt)
+  if (occurredAt) {
+    const parsed = Date.parse(occurredAt)
+    if (!ISO_OCCURRED_AT.test(occurredAt) || !Number.isFinite(parsed)) {
+      errors.push('故障发生时间必须是带时区的有效时间')
+    } else if (parsed > Date.now() + 5 * 60 * 1000) {
+      errors.push('故障发生时间不能晚于当前时间')
+    }
+  }
   if (containsDeveloperEvidence(form.system)) errors.push('故障系统不能包含 DQL、原始日志或堆栈正文')
   if (containsDeveloperEvidence(form.service)) errors.push('故障服务不能包含 DQL、原始日志或堆栈正文')
   if (containsDeveloperEvidence(form.title)) errors.push('故障现象不能包含 DQL、原始日志或堆栈正文')
@@ -96,6 +108,7 @@ export function buildFormalIncidentReport(form: FormalIncidentForm): IncidentRep
   const title = clean(form.title)
   const errorCode = clean(form.errorCode)
   const traceId = clean(form.traceId)
+  const occurredAt = clean(form.occurredAt)
 
   return {
     system,
@@ -104,6 +117,7 @@ export function buildFormalIncidentReport(form: FormalIncidentForm): IncidentRep
     severity: form.severity,
     ...(errorCode ? { errorCode } : {}),
     ...(traceId ? { traceId } : {}),
+    ...(occurredAt ? { occurredAt } : {}),
     intakeSource: 'web:formal-workbench',
     completeness: completeness(errorCode, traceId),
     rehearsal: form.rehearsal,
@@ -117,15 +131,15 @@ export function formalIncidentRoutePreview(
   if (clean(form.errorCode)) {
     return {
       tone: 'DETERMINISTIC',
-      title: '错误码 Playbook · 零 LLM 优先',
-      detail: '服务端先走已审核的错误码 Playbook；未命中已审核 Playbook 时才进入受限未命中路径，未启用或配置不合规会明确拒绝。',
+      title: '优先走标准排障方案',
+      detail: '有错误码时，先匹配已审核的标准方法；匹配不上再走受限只读调查。配置不合规会明确拒绝，不会瞎猜。',
     }
   }
   return {
     tone: 'BOUNDED_DISCOVERY',
-    title: '受限只读调查 · 未命中路径',
+    title: '没有标准方案 · 受限只读调查',
     detail: clean(form.traceId)
-      ? 'Trace 只作为已知线索进入受限只读 Agent；该路径未通过运行验收或未启用时会 fail-closed，不创建伪诊断。'
-      : '现象输入进入受限只读 Agent；该路径未通过运行验收或未启用时会 fail-closed，不创建伪诊断。',
+      ? '只能使用已批准的取证计划；证据不够就停止并转人工，不会编造高把握根因。'
+      : '按现象做受限只读调查；结论最多按中等把握看待，证据不够就停，不会创建假诊断。',
   }
 }

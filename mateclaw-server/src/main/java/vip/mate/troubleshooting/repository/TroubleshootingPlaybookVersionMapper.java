@@ -16,7 +16,7 @@ public interface TroubleshootingPlaybookVersionMapper
 
     String COLUMNS = """
             id, workspace_id, playbook_id, selector_key, playbook_version,
-            active_selector_key, system, error_code, service, status,
+            active_selector_key, system_name, error_code, service, status,
             source_origin, source_record_id, knowledge_evidence_grade,
             review_id, review_version,
             approved_by, approval_reason, approval_snapshot_json,
@@ -87,7 +87,7 @@ public interface TroubleshootingPlaybookVersionMapper
     @Select("""
             <script>
             SELECT pv.id, pv.workspace_id, pv.playbook_id, pv.selector_key,
-                   pv.playbook_version, pv.active_selector_key, pv.system,
+                   pv.playbook_version, pv.active_selector_key, pv.system_name,
                    pv.error_code, pv.service, pv.status, pv.source_origin,
                    pv.source_record_id, pv.knowledge_evidence_grade,
                    pv.review_id, pv.review_version,
@@ -111,7 +111,7 @@ public interface TroubleshootingPlaybookVersionMapper
                  AND pv.status = #{status}
                </if>
                <if test="system != null and system != ''">
-                 AND pv.system = #{system}
+                 AND pv.system_name = #{system}
                </if>
              ORDER BY pv.update_time DESC, pv.id DESC
              LIMIT #{limit}
@@ -122,6 +122,51 @@ public interface TroubleshootingPlaybookVersionMapper
             @Param("status") String status,
             @Param("system") String system,
             @Param("limit") int limit);
+
+    /**
+     * At most two live systems for an exact service/error-code selector.
+     * Two rows are enough to prove ambiguity without scanning the registry.
+     */
+    @Select("""
+            SELECT DISTINCT system_name
+              FROM mate_troubleshooting_playbook_version
+             WHERE workspace_id = #{workspaceId}
+               AND service = #{service}
+               AND error_code = #{errorCode}
+               AND active_selector_key = selector_key
+               AND status = 'APPROVED'
+               AND deleted = 0
+             ORDER BY system_name ASC
+             LIMIT 2
+            """)
+    List<String> listActiveSystemsForExactRoute(
+            @Param("workspaceId") long workspaceId,
+            @Param("service") String service,
+            @Param("errorCode") String errorCode);
+
+    /**
+     * At most two live systems for a service, regardless of error code.
+     *
+     * <p>Monitoring alerts routinely name a service without carrying an error
+     * code. Two rows are still enough to prove ambiguity, and two rows must
+     * leave the system unresolved: a service owned by more than one system is
+     * exactly the case where guessing would hand deterministic authority to
+     * the wrong Playbook.</p>
+     */
+    @Select("""
+            SELECT DISTINCT system_name
+              FROM mate_troubleshooting_playbook_version
+             WHERE workspace_id = #{workspaceId}
+               AND service = #{service}
+               AND active_selector_key = selector_key
+               AND status = 'APPROVED'
+               AND deleted = 0
+             ORDER BY system_name ASC
+             LIMIT 2
+            """)
+    List<String> listActiveSystemsForService(
+            @Param("workspaceId") long workspaceId,
+            @Param("service") String service);
 
     @Select(SELECT_COLUMNS + """
               FROM mate_troubleshooting_playbook_version

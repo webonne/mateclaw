@@ -9,6 +9,9 @@ import vip.mate.troubleshooting.TroubleshootingSecretRedactor;
 import vip.mate.troubleshooting.agent.TroubleshootingAgentTriageService;
 import vip.mate.troubleshooting.evidence.EvidenceProvenance;
 import vip.mate.troubleshooting.evidence.EvidenceSourceRouter;
+import vip.mate.troubleshooting.evidence.EvidenceSpineOrchestrator;
+import vip.mate.troubleshooting.evidence.EvidenceSpinePlan;
+import vip.mate.troubleshooting.evidence.EvidenceSpinePlanResolver;
 import vip.mate.troubleshooting.evidence.PlaybookEvidenceCollector;
 import vip.mate.troubleshooting.model.EvidenceResult;
 import vip.mate.troubleshooting.model.IncidentCompleteness;
@@ -21,6 +24,7 @@ import vip.mate.troubleshooting.intake.IntakeSessionStatus;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Intake seam for the deterministic hit path.
@@ -54,20 +58,31 @@ public class TroubleshootingIntakeService {
     private final TroubleshootingSopPersistenceService sopPersistence;
     private final DeterministicDiagnosisService diagnosisService;
     private final EvidenceSourceRouter evidenceRouter;
+    private final EvidenceSpineOrchestrator evidenceSpineOrchestrator;
     private final TroubleshootingAgentTriageService agentTriageService;
+    private final ScenarioSymptomRouter scenarioRouter;
     private final Clock clock;
 
     public TroubleshootingIntakeService(
             TroubleshootingSopPersistenceService sopPersistence,
             DeterministicDiagnosisService diagnosisService) {
-        this(sopPersistence, diagnosisService, null, null, Clock.systemUTC());
+        this(sopPersistence, diagnosisService, null, null, null, Clock.systemUTC());
     }
 
     public TroubleshootingIntakeService(
             TroubleshootingSopPersistenceService sopPersistence,
             DeterministicDiagnosisService diagnosisService,
             EvidenceSourceRouter evidenceRouter) {
-        this(sopPersistence, diagnosisService, evidenceRouter, null, Clock.systemUTC());
+        this(sopPersistence, diagnosisService, evidenceRouter, null, null, Clock.systemUTC());
+    }
+
+    public TroubleshootingIntakeService(
+            TroubleshootingSopPersistenceService sopPersistence,
+            DeterministicDiagnosisService diagnosisService,
+            EvidenceSourceRouter evidenceRouter,
+            TroubleshootingAgentTriageService agentTriageService) {
+        this(sopPersistence, diagnosisService, evidenceRouter, null,
+                agentTriageService, Clock.systemUTC());
     }
 
     @Autowired
@@ -75,8 +90,10 @@ public class TroubleshootingIntakeService {
             TroubleshootingSopPersistenceService sopPersistence,
             DeterministicDiagnosisService diagnosisService,
             EvidenceSourceRouter evidenceRouter,
+            EvidenceSpineOrchestrator evidenceSpineOrchestrator,
             TroubleshootingAgentTriageService agentTriageService) {
-        this(sopPersistence, diagnosisService, evidenceRouter, agentTriageService,
+        this(sopPersistence, diagnosisService, evidenceRouter, evidenceSpineOrchestrator,
+                agentTriageService,
                 Clock.systemUTC());
     }
 
@@ -84,7 +101,7 @@ public class TroubleshootingIntakeService {
             TroubleshootingSopPersistenceService sopPersistence,
             DeterministicDiagnosisService diagnosisService,
             Clock clock) {
-        this(sopPersistence, diagnosisService, null, null, clock);
+        this(sopPersistence, diagnosisService, null, null, null, clock);
     }
 
     TroubleshootingIntakeService(
@@ -92,7 +109,7 @@ public class TroubleshootingIntakeService {
             DeterministicDiagnosisService diagnosisService,
             EvidenceSourceRouter evidenceRouter,
             Clock clock) {
-        this(sopPersistence, diagnosisService, evidenceRouter, null, clock);
+        this(sopPersistence, diagnosisService, evidenceRouter, null, null, clock);
     }
 
     TroubleshootingIntakeService(
@@ -101,10 +118,27 @@ public class TroubleshootingIntakeService {
             EvidenceSourceRouter evidenceRouter,
             TroubleshootingAgentTriageService agentTriageService,
             Clock clock) {
+        this(sopPersistence, diagnosisService, evidenceRouter, null,
+                agentTriageService, clock);
+    }
+
+    TroubleshootingIntakeService(
+            TroubleshootingSopPersistenceService sopPersistence,
+            DeterministicDiagnosisService diagnosisService,
+            EvidenceSourceRouter evidenceRouter,
+            EvidenceSpineOrchestrator evidenceSpineOrchestrator,
+            TroubleshootingAgentTriageService agentTriageService,
+            Clock clock) {
         this.sopPersistence = sopPersistence;
         this.diagnosisService = diagnosisService;
         this.evidenceRouter = evidenceRouter;
+        this.evidenceSpineOrchestrator = evidenceSpineOrchestrator;
         this.agentTriageService = agentTriageService;
+        // Derived rather than injected: it reads the same registry and holds no
+        // state of its own, so every existing constructor keeps its arity.
+        this.scenarioRouter = sopPersistence == null
+                ? null
+                : new ScenarioSymptomRouter(sopPersistence);
         this.clock = clock;
     }
 
@@ -142,6 +176,11 @@ public class TroubleshootingIntakeService {
 
     /** Starts investigation from a complete, durably persisted channel intake. */
     public StoredDiagnosis report(IntakeSession session) {
+        return report(session, false);
+    }
+
+    /** Starts a Web conversation intake with an explicit rehearsal boundary. */
+    public StoredDiagnosis report(IntakeSession session, boolean rehearsal) {
         if (session == null || session.status() != IntakeSessionStatus.READY
                 || session.readyAt() == null) {
             throw badRequest("READY intake session is required");
@@ -164,7 +203,7 @@ public class TroubleshootingIntakeService {
                 session.workspaceId(),
                 incident,
                 List.of(),
-                false,
+                rehearsal,
                 session.reportedAt(),
                 session.readyAt(),
                 session.intakeSessionId());
@@ -188,21 +227,41 @@ public class TroubleshootingIntakeService {
         requireSafeIncidentText(sanitizedIncident);
         List<EvidenceResult> sanitizedSuppliedEvidence =
                 TroubleshootingEvidenceSanitizer.sanitizeSupplied(evidence);
+        SopEntry sop = null;
         String routeMissReason = deterministicRouteMissReason(sanitizedIncident);
         if (routeMissReason != null) {
-            return triageRouteMiss(
-                    workspaceId,
-                    sanitizedIncident,
-                    sanitizedSuppliedEvidence,
-                    rehearsal,
-                    routeMissReason,
-                    reportedAt,
-                    intakeReadyAt == null ? clock.instant() : intakeReadyAt,
-                    intakeSessionId);
+            // An alert raised by symptom rather than by error code can still be
+            // owned by a reviewed Playbook. Only a unique declared match counts;
+            // anything else keeps the miss reason it already had.
+            ScenarioSymptomRouter.ScenarioRoute scenarioRoute =
+                    scenarioRouter == null || !symptomRoutable(sanitizedIncident)
+                            ? null
+                            : scenarioRouter.route(workspaceId, sanitizedIncident);
+            if (scenarioRoute != null && scenarioRoute.matched()) {
+                sop = scenarioRoute.playbook();
+                // The alert named no code; the matched Playbook names the route.
+                // Stamping it here is what lets the scenario lane reuse the one
+                // deterministic engine instead of growing a parallel one.
+                sanitizedIncident = sanitizedIncident.withResolvedRoute(sop.errorCode());
+            } else {
+                return triageRouteMiss(
+                        workspaceId,
+                        sanitizedIncident,
+                        sanitizedSuppliedEvidence,
+                        rehearsal,
+                        scenarioRoute == null
+                                ? routeMissReason
+                                : routeMissReason + "; " + scenarioRoute.missReason(),
+                        reportedAt,
+                        intakeReadyAt == null ? clock.instant() : intakeReadyAt,
+                        intakeSessionId);
+            }
         }
 
-        SopEntry sop = sopPersistence.find(
-                workspaceId, sanitizedIncident.system(), sanitizedIncident.errorCode());
+        if (sop == null) {
+            sop = sopPersistence.find(
+                    workspaceId, sanitizedIncident.system(), sanitizedIncident.errorCode());
+        }
         if (sop == null) {
             return triageRouteMiss(
                     workspaceId,
@@ -255,10 +314,51 @@ public class TroubleshootingIntakeService {
             SopEntry sop,
             IncidentContext incident,
             List<EvidenceResult> supplied) {
-        // Same collection the scenario lane runs after its Diagnosis is already
-        // waiting. One implementation, two arrival orders (A9).
+        EvidenceSpinePlan spinePlan;
+        try {
+            spinePlan = EvidenceSpinePlanResolver.resolve(sop);
+        } catch (IllegalArgumentException invalidContract) {
+            throw conflict("the frozen Evidence Spine contract is invalid");
+        }
+        if (spinePlan != null && supplied.isEmpty()) {
+            if (evidenceSpineOrchestrator == null) {
+                throw conflict("the Evidence Spine runtime is not available");
+            }
+            return evidenceSpineOrchestrator.collect(
+                    workspaceId, incident, spinePlan, null).evidence();
+        }
+        if (spinePlan != null && !supplied.isEmpty()) {
+            Set<String> expectedIds = sop.evidenceRequests().stream()
+                    .map(request -> request.requestId())
+                    .collect(java.util.stream.Collectors.toUnmodifiableSet());
+            Set<String> suppliedIds = supplied.stream()
+                    .map(EvidenceResult::queryId)
+                    .collect(java.util.stream.Collectors.toUnmodifiableSet());
+            if (supplied.size() != expectedIds.size()
+                    || suppliedIds.size() != supplied.size()
+                    || !suppliedIds.equals(expectedIds)) {
+                throw conflict(
+                        "a partial caller-supplied Evidence Spine cannot be completed safely");
+            }
+        }
+        // Generic Playbooks and complete caller-supplied replay evidence keep the
+        // existing path. A dependent spine is always executed by the shared
+        // orchestrator above so trace/contrast receive the observed correlation ID.
         return new PlaybookEvidenceCollector(evidenceRouter)
                 .collect(workspaceId, sop, incident, supplied);
+    }
+
+    /**
+     * Whether a symptom may stand in for the missing error code.
+     *
+     * <p>Only the absent code is substitutable. An unstructured report is a
+     * different failure: its system and service were never confirmed, so
+     * matching its free text against a Playbook would attach reviewed authority
+     * to fields nobody has verified. Those keep going to the miss path, where
+     * Intake can still ask for the structured fields.
+     */
+    private boolean symptomRoutable(IncidentContext incident) {
+        return incident.completeness() != IncidentCompleteness.SYMPTOM;
     }
 
     private String deterministicRouteMissReason(IncidentContext incident) {
@@ -342,6 +442,10 @@ public class TroubleshootingIntakeService {
 
     private MateClawException routeMiss(String message) {
         return new MateClawException("err.troubleshooting.route_miss", 409, message);
+    }
+
+    private MateClawException conflict(String message) {
+        return new MateClawException("err.troubleshooting.conflict", 409, message);
     }
 
     private MateClawException badRequest(String message) {

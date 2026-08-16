@@ -5,6 +5,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import vip.mate.troubleshooting.agent.OpenDiscoveryRunAudit;
+import vip.mate.troubleshooting.agent.OpenDiscoveryRunAuditService;
+import vip.mate.troubleshooting.evidence.ScenarioEvidenceRunAudit;
+import vip.mate.troubleshooting.evidence.ScenarioEvidenceRunAuditService;
+import vip.mate.troubleshooting.model.ActionType;
+import vip.mate.troubleshooting.model.ApprovalStatus;
 import vip.mate.troubleshooting.model.BlastRadius;
 import vip.mate.troubleshooting.model.Confidence;
 import vip.mate.troubleshooting.model.ConclusionType;
@@ -15,6 +21,7 @@ import vip.mate.troubleshooting.model.DiagnosisStatus;
 import vip.mate.troubleshooting.model.EvidenceResult;
 import vip.mate.troubleshooting.model.EvidenceRequest;
 import vip.mate.troubleshooting.model.EvidenceStatus;
+import vip.mate.troubleshooting.model.ExecutionStatus;
 import vip.mate.troubleshooting.model.IncidentCompleteness;
 import vip.mate.troubleshooting.model.IncidentContext;
 import vip.mate.troubleshooting.model.IncidentImpact;
@@ -22,6 +29,7 @@ import vip.mate.troubleshooting.model.InvestigationMode;
 import vip.mate.troubleshooting.model.KnowledgeEvidenceGrade;
 import vip.mate.troubleshooting.model.NorthStarTimings;
 import vip.mate.troubleshooting.model.PlaybookVersionRef;
+import vip.mate.troubleshooting.model.RecommendedAction;
 import vip.mate.troubleshooting.model.RouteSemanticsProvenance;
 import vip.mate.troubleshooting.model.RouteMode;
 import vip.mate.troubleshooting.model.RouteAuthority;
@@ -41,6 +49,8 @@ import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -67,6 +77,15 @@ class DiagnosisExperienceProjectionServiceTest {
     @Mock
     private TroubleshootingPlaybookVersionService playbookVersions;
 
+    @Mock
+    private ScenarioEvidenceRunAuditService runAudits;
+
+    @Mock
+    private OpenDiscoveryRunAuditService openDiscoveryRuns;
+
+    @Mock
+    private SystemOnboardingGapService onboardingGaps;
+
     private DiagnosisExperienceProjectionService service;
 
     @BeforeEach
@@ -77,7 +96,10 @@ class DiagnosisExperienceProjectionServiceTest {
                 new CanonicalEvidenceViewProjector(new DeterministicLogTraceCompressor()),
                 topologyScenarioPolicy,
                 playbookVersions,
-                new InvestigationTraceProjector());
+                new InvestigationTraceProjector(),
+                runAudits,
+                openDiscoveryRuns,
+                onboardingGaps);
     }
 
     @Test
@@ -100,7 +122,6 @@ class DiagnosisExperienceProjectionServiceTest {
         when(playbookVersions.findByRef(
                 WORKSPACE_ID, new PlaybookVersionRef("playbook-903001", 3)))
                 .thenReturn(Optional.of(frozenVersion));
-
         DiagnosisExperienceProjection result = service.project(WORKSPACE_ID, DIAGNOSIS_ID);
 
         DiagnosisExperienceProjection.BusinessSummary business = result.businessSummary();
@@ -124,10 +145,15 @@ class DiagnosisExperienceProjectionServiceTest {
         assertThat(business.timings().investigateCost())
                 .isEqualTo(java.time.Duration.ofSeconds(164));
         assertThat(business.fixtureMode()).isTrue();
+        assertThat(business.rootCause()).isEqualTo("Mongo 连接池打满");
+        assertThat(business.headline()).isEqualTo("已定位到出问题的环节");
+        assertThat(business.narrative()).isEqualTo("连接池利用率达到 100%");
+        assertThat(business.keyEvidence()).isNull();
 
         DiagnosisExperienceProjection.DeveloperEvidenceView developer = result.developerEvidence();
         assertThat(developer.investigationMode())
                 .isEqualTo(InvestigationMode.ERROR_CODE_PLAYBOOK);
+        verify(runAudits, never()).latest(WORKSPACE_ID, DIAGNOSIS_ID);
         assertThat(developer.routeSemanticsProvenance())
                 .isEqualTo(RouteSemanticsProvenance.PERSISTED);
         assertThat(developer.routeAuthority())
@@ -158,7 +184,7 @@ class DiagnosisExperienceProjectionServiceTest {
                 .extracting(InvestigationTraceView.EvidenceContractView::requestId)
                 .containsExactly("EV-2");
         assertThat(developer.contrast().available()).isFalse();
-        assertThat(developer.capabilityLimits()).anyMatch(item -> item.contains("生产变更"));
+        assertThat(developer.capabilityLimits()).anyMatch(item -> item.contains("改生产环境"));
         assertThat(developer.fixtureMode()).isTrue();
     }
 
@@ -216,13 +242,21 @@ class DiagnosisExperienceProjectionServiceTest {
         assertThat(developer.callChain().emptyReason()).isNull();
 
         assertThat(developer.contrast().available()).isTrue();
-        assertThat(developer.contrast().failedSample()).isEqualTo("失败样本 92/100（92%）");
-        assertThat(developer.contrast().baselineSample()).isEqualTo("成功样本 3/100（3%）");
+        assertThat(developer.contrast().featureCode()).isEqualTo("session_state_conflict");
+        assertThat(developer.contrast().failedRequests())
+                .isEqualTo(new DiagnosisExperienceProjection.ComparisonGroupView(100, 92));
+        assertThat(developer.contrast().normalRequests())
+                .isEqualTo(new DiagnosisExperienceProjection.ComparisonGroupView(100, 3));
         assertThat(developer.contrast().note())
-                .contains("session_state_conflict")
-                .contains("89 个百分点");
+                .isEqualTo("失败请求与正常请求的结构化对照已记录。");
         assertThat(developer.contrast().evidenceRefs())
                 .containsExactly("SYNTH-CONTRAST-SAMPLE");
+        assertThat(result.businessSummary().rootCause())
+                .isEqualTo("session-state 并发状态写入冲突");
+        assertThat(result.businessSummary().narrative())
+                .isEqualTo("会话状态写入冲突");
+        assertThat(result.businessSummary().keyEvidence())
+                .isEqualTo("异常 92/100 命中同一特征，正常 3/100。");
         assertThat(developer.capabilityLimits())
                 .noneMatch(item -> item.contains("尚未保存完整调用链 hop 和成功样本对照"));
     }
@@ -358,6 +392,79 @@ class DiagnosisExperienceProjectionServiceTest {
                 .isEqualTo(RouteAuthority.MODEL_PROPOSED);
     }
 
+    /**
+     * An unonboarded system collects nothing, so telling the reporter to bring
+     * more logs points them at evidence no configured path would have read.
+     */
+    @Test
+    void anUnonboardedSystemAsksForConfigurationRatherThanMoreEvidence() {
+        when(persistence.get(WORKSPACE_ID, DIAGNOSIS_ID))
+                .thenReturn(new StoredDiagnosis(abstainedDiagnosis(), 0, true));
+        when(onboardingGaps.inspect(eq(WORKSPACE_ID), any())).thenReturn(List.of(
+                new SystemOnboardingGap(
+                        SystemOnboardingGapKind.EVIDENCE_ROUTE,
+                        "这个系统没有声明取证路由",
+                        "没有显式声明就不会有默认源",
+                        "工作区管理员")));
+
+        DiagnosisExperienceProjection result = service.project(WORKSPACE_ID, DIAGNOSIS_ID);
+
+        assertThat(result.businessSummary().nextStep().label()).isEqualTo("先完成系统接入");
+        assertThat(result.businessSummary().nextStep().text())
+                .contains("这个系统没有声明取证路由")
+                .contains("工作区管理员");
+        assertThat(result.businessSummary().nextStep().text())
+                .as("the reporter cannot close a configuration gap by adding logs")
+                .doesNotContain("补齐缺失的日志");
+        assertThat(result.businessSummary().narrative()).contains("配置缺口");
+    }
+
+    @Test
+    void aFullyOnboardedSystemKeepsTheOrdinaryEvidenceShortageWording() {
+        when(persistence.get(WORKSPACE_ID, DIAGNOSIS_ID))
+                .thenReturn(new StoredDiagnosis(abstainedDiagnosis(), 0, true));
+        when(onboardingGaps.inspect(eq(WORKSPACE_ID), any())).thenReturn(List.of());
+
+        DiagnosisExperienceProjection result = service.project(WORKSPACE_ID, DIAGNOSIS_ID);
+
+        assertThat(result.businessSummary().nextStep().label()).isEqualTo("下一步");
+        assertThat(result.businessSummary().nextStep().text()).contains("补齐缺失的日志");
+    }
+
+    @Test
+    void loadsTheImmutableOpenDiscoveryRunIntoTheDeveloperTrace() {
+        when(persistence.get(WORKSPACE_ID, DIAGNOSIS_ID))
+                .thenReturn(new StoredDiagnosis(abstainedDiagnosis(), 0, true));
+        when(openDiscoveryRuns.latest(WORKSPACE_ID, DIAGNOSIS_ID))
+                .thenReturn(Optional.of(new OpenDiscoveryRunAudit(
+                        "run-1",
+                        DIAGNOSIS_ID,
+                        List.of("message_send_failed"),
+                        "message_send_failed",
+                        List.of("log_search", "log_trace_bundle", "contrast_sample"),
+                        6,
+                        6,
+                        2,
+                        java.time.Duration.ofSeconds(20),
+                        OpenDiscoveryRunAudit.StopReason.CORE_EVIDENCE_INCOMPLETE,
+                        List.of("ONLINE-LOG-SEARCH"),
+                        READY_AT,
+                        READY_AT.plusSeconds(3),
+                        "agent:88")));
+
+        DiagnosisExperienceProjection result = service.project(WORKSPACE_ID, DIAGNOSIS_ID);
+
+        assertThat(result.developerEvidence().investigationTrace().stages())
+                .filteredOn(stage -> stage.key()
+                        == InvestigationTraceView.StageKey.PLAYBOOK_ROUTE)
+                .singleElement()
+                .satisfies(stage -> assertThat(stage.summary())
+                        .contains("受限调查").contains("message_send_failed"));
+        assertThat(result.developerEvidence().investigationTrace().stopReason().message())
+                .contains("核心证据链不完整");
+        verify(runAudits, never()).latest(WORKSPACE_ID, DIAGNOSIS_ID);
+    }
+
     @Test
     void projectsExcludedAsAReviewableExclusionRatherThanAbstentionOrLocation() {
         when(persistence.get(WORKSPACE_ID, DIAGNOSIS_ID))
@@ -380,6 +487,17 @@ class DiagnosisExperienceProjectionServiceTest {
                 .thenReturn(new StoredDiagnosis(scenarioDiagnosis(), 0, true));
         when(derivationService.explain(WORKSPACE_ID, DIAGNOSIS_ID))
                 .thenReturn(derivation());
+        when(runAudits.latest(WORKSPACE_ID, DIAGNOSIS_ID)).thenReturn(Optional.of(
+                new ScenarioEvidenceRunAudit(
+                        "scenario-evidence-run-1",
+                        DIAGNOSIS_ID,
+                        new PlaybookVersionRef("playbook-slow-api", 2),
+                        DiagnosisStatus.READY_FOR_HUMAN,
+                        ConclusionType.LOCATED,
+                        List.of("EV-1", "EV-2"),
+                        NOW.plusSeconds(10),
+                        NOW.plusSeconds(15),
+                        "alice")));
 
         DiagnosisExperienceProjection result = service.project(WORKSPACE_ID, DIAGNOSIS_ID);
 
@@ -390,6 +508,12 @@ class DiagnosisExperienceProjectionServiceTest {
         assertThat(result.developerEvidence().routeAuthority())
                 .isEqualTo(RouteAuthority.RULE_MATCHED);
         assertThat(result.developerEvidence().scenarioAffordances()).isEmpty();
+        assertThat(result.developerEvidence().investigationTrace().stages())
+                .filteredOn(stage -> stage.key()
+                        == InvestigationTraceView.StageKey.EVIDENCE_COLLECTION)
+                .singleElement()
+                .satisfies(stage -> assertThat(stage.duration())
+                        .isEqualTo(java.time.Duration.ofSeconds(5)));
     }
 
     @Test
@@ -449,7 +573,7 @@ class DiagnosisExperienceProjectionServiceTest {
         assertThat(projection.developerEvidence().routeSemanticsProvenance())
                 .isEqualTo(RouteSemanticsProvenance.PERSISTED);
         assertThat(projection.developerEvidence().capabilityLimits())
-                .anyMatch(item -> item.contains("开放调查路径没有可复算的确定性 SOP 判据链"));
+                .anyMatch(item -> item.contains("开放调查") && item.contains("标准排障方案"));
         assertThat(projection.developerEvidence().steps())
                 .extracting(DiagnosisExperienceProjection.EvidenceStep::kind)
                 .doesNotContain(DiagnosisExperienceProjection.EvidenceStepKind.CRITERION);
@@ -469,6 +593,71 @@ class DiagnosisExperienceProjectionServiceTest {
 
         assertThat(result.developerEvidence()
                 .requiresScenario(DeploymentTopologyScenarioPolicy.SCENARIO_KEY)).isTrue();
+    }
+
+    @Test
+    void listsEveryRecommendedActionAndWhoPerformsIt() {
+        Diagnosis located = Diagnosis.initial(
+                DIAGNOSIS_ID, "case-1", "run-1", incident(),
+                RouteMode.DETERMINISTIC,
+                InvestigationMode.ERROR_CODE_PLAYBOOK,
+                RouteAuthority.EXPLICIT,
+                ConclusionType.LOCATED,
+                NorthStarTimings.concluded(REPORTED_AT, READY_AT, NOW),
+                DiagnosisStatus.READY_FOR_HUMAN,
+                "对照显示工单升级路由更慢", "工单升级链路同步等待外部 IT 网关",
+                Confidence.MEDIUM, false,
+                "csdp:scenario:url_slow_request", "URL 慢请求",
+                new PlaybookVersionRef("playbook-url-slow", 2),
+                List.of(), List.of(),
+                List.of(
+                        new RecommendedAction(
+                                "USR-A1", ActionType.AUTO_READONLY,
+                                "只读复核慢请求路由分布",
+                                "只读查看同窗口聚合对照，不执行任何生产变更。",
+                                false, ApprovalStatus.NOT_REQUIRED, ExecutionStatus.PENDING),
+                        new RecommendedAction(
+                                "USR-A2", ActionType.HUMAN_CONTACT,
+                                "向 IT 网关 owner 核实 upToCtiV2 基线延迟",
+                                "由网关 owner 在平台之外核查；平台只提供证据。",
+                                false, ApprovalStatus.NOT_REQUIRED, ExecutionStatus.PENDING)),
+                "客服组", true, true, List.of(), List.of());
+        when(persistence.get(WORKSPACE_ID, DIAGNOSIS_ID))
+                .thenReturn(new StoredDiagnosis(located, 0, true));
+        when(derivationService.explain(WORKSPACE_ID, DIAGNOSIS_ID))
+                .thenReturn(derivation());
+
+        DiagnosisExperienceProjection.NextStep next =
+                service.project(WORKSPACE_ID, DIAGNOSIS_ID).businessSummary().nextStep();
+
+        assertThat(next.label()).isEqualTo("定位结果");
+        assertThat(next.text())
+                .contains("1. 只读复核慢请求路由分布")
+                .contains("系统可代做")
+                .contains("2. 向 IT 网关 owner 核实 upToCtiV2 基线延迟")
+                .contains("需人去联系确认");
+    }
+
+    @Test
+    void refusesToNameACauseWhenTheConclusionIsAnAbstention() {
+        DiagnosisExperienceProjection.ImpactView impact = new DiagnosisExperienceProjection.ImpactView(
+                "订单创建", null, null,
+                BlastRadius.UNKNOWN,
+                List.of(), null, "未测量");
+        DiagnosisExperienceProjection.NextStep next = new DiagnosisExperienceProjection.NextStep(
+                "下一步", "补齐证据", "证据不足，系统已弃权且没有给出根因");
+        assertThatThrownBy(() -> new DiagnosisExperienceProjection.BusinessSummary(
+                DIAGNOSIS_ID,
+                ConclusionType.INSUFFICIENT_EVIDENCE,
+                "证据不足，系统已停止自动判断",
+                "Mongo 连接池打满",
+                "关键证据缺失。",
+                null,
+                Confidence.LOW,
+                "订单超时", impact, next, DiagnosisStatus.READY_FOR_HUMAN,
+                NorthStarTimings.unrecorded(), false))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must not name a root cause");
     }
 
     @Test
@@ -494,7 +683,7 @@ class DiagnosisExperienceProjectionServiceTest {
         assertThatThrownBy(() -> new DiagnosisExperienceProjection.BusinessSummary(
                 DIAGNOSIS_ID,
                 ConclusionType.EXCLUDED,
-                "已排除当前假设", "证据不支持当前假设。", Confidence.HIGH,
+                "已排除当前假设", null, "证据不支持当前假设。", null, Confidence.HIGH,
                 "订单超时", impact, next, DiagnosisStatus.READY_FOR_HUMAN,
                 timings, false))
                 .isInstanceOf(IllegalArgumentException.class)

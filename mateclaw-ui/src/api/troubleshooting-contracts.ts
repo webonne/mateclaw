@@ -38,8 +38,29 @@ export interface IncidentReportRequest {
   severity: IncidentSeverity
   errorCode?: string
   traceId?: string
+  occurredAt?: string
   intakeSource: 'web:formal-workbench'
   completeness: IncidentCompleteness
+  rehearsal: boolean
+}
+
+/** One turn of the Web conversation intake that reuses IntakeSession. */
+export interface ConversationTurnRequest {
+  conversationId?: string | null
+  text: string
+  rehearsal: boolean
+}
+
+export interface ConversationTurnResult {
+  conversationId: string
+  intakeSessionId: string
+  status: 'RECEIVED' | 'AWAITING_INPUT' | 'READY' | string
+  missingFields: string[]
+  prompt: string
+  duplicate: boolean
+  outOfOrder: boolean
+  diagnosisId: string | null
+  created: boolean | null
   rehearsal: boolean
 }
 
@@ -412,10 +433,10 @@ export interface LogTraceDurationSummary {
 export interface LogTraceContrastSummary {
   available: boolean
   discriminatingFeature: string
-  failureSampleCount: number
-  failureMatchCount: number
-  successSampleCount: number
-  successMatchCount: number
+  failureSampleCount: number | string
+  failureMatchCount: number | string
+  successSampleCount: number | string
+  successMatchCount: number | string
   failureRate: number
   successRate: number
   rateDelta: number
@@ -592,6 +613,8 @@ export interface DiagnosisSummary {
   routeAuthority: RouteAuthority | null
   routeSemanticsProvenance: RouteSemanticsProvenance
   rehearsal: boolean
+  /** Immutable pilot cohort admitted by the backend at Diagnosis creation. */
+  pilotPlanVersion?: number | null
   version: number
   createTime: string
   updateTime: string
@@ -721,7 +744,11 @@ export interface BusinessSummary {
   diagnosisId: string
   conclusionType: ConclusionType
   headline: string
+  /** Null unless the conclusion actually names a cause; never set when abstained. */
+  rootCause: string | null
   narrative: string
+  /** Plain-language counts behind the conclusion; null when no contrast was collected. */
+  keyEvidence: string | null
   confidence: Confidence
   problem: string
   impact: ImpactView
@@ -857,10 +884,16 @@ export interface InvestigationTraceView {
 
 export interface ContrastView {
   available: boolean
-  failedSample: string | null
-  baselineSample: string | null
+  featureCode: string | null
+  failedRequests: ComparisonGroupView | null
+  normalRequests: ComparisonGroupView | null
   note: string
   evidenceRefs: string[]
+}
+
+export interface ComparisonGroupView {
+  totalRequests: number | string
+  requestsWithFeature: number | string
 }
 
 export interface DraftView {
@@ -935,6 +968,129 @@ export interface GuanceEvidenceReadiness {
   uniqueAssetAuthorized: boolean
   signals: GuanceSignalReadiness[]
   blockers: string[]
+}
+
+/** Whether these settings are the workspace's own row or the deployment yml. */
+export type EvidenceSettingsOrigin = 'DEPLOYMENT' | 'WORKSPACE'
+
+/**
+ * One workspace's evidence source settings as the browser is allowed to see them.
+ *
+ * <p>There is deliberately no field carrying the API key. The credential is
+ * write-only across this API: the UI can show that one exists and how it ends,
+ * but never reads it back.
+ */
+export interface EvidenceSettingsView {
+  workspaceId: number
+  guanceEnabled: boolean
+  guanceBaseUrl: string | null
+  guanceApiKeyPresent: boolean
+  /** `null` when no key is stored, otherwise a hint such as `****a1b2`. */
+  guanceApiKeyMask: string | null
+  guanceAllowInsecureHttp: boolean
+  replayEnabled: boolean
+  agentEnabled: boolean
+  version: number
+  changedBy: string | null
+  changeReason: string | null
+  origin: EvidenceSettingsOrigin
+}
+
+/** One owner-submitted change; see `saveEvidenceSettings` for the key semantics. */
+export interface EvidenceSettingsUpdate {
+  guanceEnabled: boolean
+  guanceBaseUrl: string | null
+  /** Omit to keep the stored key, `''` to clear it, a value to replace it. */
+  guanceApiKey?: string | null
+  guanceAllowInsecureHttp: boolean
+  replayEnabled: boolean
+  agentEnabled: boolean
+  expectedVersion: number
+  changeReason: string | null
+}
+
+export type OpenDiscoveryReadinessStatus =
+  | 'DISABLED'
+  | 'BLOCKED'
+  | 'READY_FOR_REHEARSAL'
+  | 'READY_FOR_BOUNDED_FALLBACK'
+
+export interface OpenDiscoveryPlanSummary {
+  scenarioKey: string
+  system: string
+  enabled: boolean
+  visibleForRequestedSystem: boolean
+  permittedPlatforms: string[]
+  includesTrueSource: boolean
+}
+
+/** Secret-free readiness for the OPEN_DISCOVERY / miss-path night-time fallback. */
+export interface OpenDiscoveryReadiness {
+  status: OpenDiscoveryReadinessStatus
+  agentEnabled: boolean
+  configuredAgentId: string | number
+  configuredAgentName?: string
+  agentBindingSource?: 'WORKSPACE' | 'CONFIG' | 'NONE' | string
+  agentReady: boolean
+  configuredPlanCount: number
+  visiblePlanCount: number
+  trueSourcePermitted: boolean
+  plans: OpenDiscoveryPlanSummary[]
+  blockers: string[]
+  nextAction: string
+}
+
+export interface OpenDiscoveryAgentBinding {
+  workspaceId: string | number
+  agentId: string | number
+  agentName?: string | null
+  source: 'WORKSPACE' | 'CONFIG' | 'NONE' | string
+  boundBy?: string | null
+  boundAt?: string | null
+  blockers: string[]
+  ready: boolean
+}
+
+export interface TroubleshootingPilotModuleScope {
+  system: string
+  service: string
+}
+
+export interface TroubleshootingPilotMember {
+  /** Backend-issued Snowflake identifier; keep as a string when editing. */
+  userId: string | number
+  username?: string | null
+  nickname?: string | null
+  displayName: string
+  workspaceRole?: string | null
+}
+
+/** Latest immutable first-wave pilot declaration for the current Workspace. */
+export interface TroubleshootingPilotPlan {
+  workspaceId: string | number
+  configured: boolean
+  enabled: boolean
+  version: number
+  name?: string | null
+  modules: TroubleshootingPilotModuleScope[]
+  secondLine?: TroubleshootingPilotMember | null
+  thirdLine?: TroubleshootingPilotMember | null
+  sourceOwner?: TroubleshootingPilotMember | null
+  changedBy?: string | null
+  changedAt?: string | null
+  changeReason?: string | null
+  blockers: string[]
+}
+
+export interface DeclareTroubleshootingPilotPlanRequest {
+  name: string
+  modules: TroubleshootingPilotModuleScope[]
+  secondLineUserId: string | number
+  thirdLineUserId: string | number
+  sourceOwnerUserId: string | number
+  enabled: boolean
+  expectedVersion: number
+  reason: string
 }
 
 export type EvidenceRouteOrigin = 'WORKSPACE' | 'DEPLOYMENT' | 'UNCONFIGURED'
@@ -1125,6 +1281,52 @@ export interface ObservabilityAssetContractOption {
   requiredAssetParameters: string[]
 }
 
+export type EvidenceContractScopeType = 'GENERIC' | 'SYSTEM' | 'MODULE'
+
+export interface EvidenceContractView {
+  contractRef: string
+  signalKind: string
+  scopeType: EvidenceContractScopeType | string
+  system: string
+  service: string
+  scenario: string
+  question: string
+  summary: string
+  namespace: string
+  maxRows: number
+  fixedConditions: string[]
+  requiredAssetParameters: string[]
+  origin: 'DEPLOYMENT' | 'WORKSPACE' | string
+  enabled: boolean
+  version: number
+  queryTemplate?: string | null
+}
+
+export interface EvidenceContractCatalog {
+  workspaceId: number
+  contracts: EvidenceContractView[]
+}
+
+export interface DeclareEvidenceContractRequest {
+  contractRef: string
+  signalKind: string
+  scopeType: EvidenceContractScopeType
+  system?: string
+  service?: string
+  scenario: string
+  question: string
+  summary?: string
+  namespace?: string
+  maxRows?: number
+  queryTemplate: string
+  fixedConditions?: string[]
+  requiredAssetParameters?: string[]
+  fieldAliases?: Record<string, string>
+  enabled: boolean
+  expectedVersion?: number
+  reason: string
+}
+
 export interface ObservabilityAssetCatalog {
   workspaceId: number
   assets: ObservabilityAsset[]
@@ -1271,10 +1473,11 @@ export interface GuanceSpinePreviewStep {
 
 export interface GuanceSpineContrast {
   available: boolean
-  failureSampleCount: number
-  failureMatchCount: number
-  successSampleCount: number
-  successMatchCount: number
+  discriminatingFeature: string | null
+  failureSampleCount: number | string
+  failureMatchCount: number | string
+  successSampleCount: number | string
+  successMatchCount: number | string
   failureRate: number
   successRate: number
   rateDelta: number
@@ -1405,6 +1608,13 @@ export interface TopologyProbeEvidenceRun {
 export type EvaluationSampleSourcePlatform = 'GUANCE' | 'RECORDED_REPLAY'
 export type EvaluationSampleReferenceStatus = 'EVIDENCE_CAPTURED' | 'READY_FOR_EVALUATION'
 export type EvaluationExpectedDisposition = 'DRAFT' | 'ABSTAIN'
+export type EvaluationHumanBaselineBasis = 'MEASURED' | 'ESTIMATED'
+
+export interface EvaluationHumanBaseline {
+  minutesToLocate: number
+  basis: EvaluationHumanBaselineBasis
+  note: string
+}
 
 export interface EvaluationEvidenceSnapshot {
   stage: Exclude<GuanceSpinePreviewStage, 'BLOCKED'>
@@ -1459,6 +1669,8 @@ export interface EvidenceEvaluationSample {
   referenceStatus: EvaluationSampleReferenceStatus
   referenceSolution: EvaluationReferenceSolution | null
   expectedDisposition: EvaluationExpectedDisposition | null
+  /** Optional human time before MateClaw; measured and estimated cohorts never mix. */
+  humanBaseline: EvaluationHumanBaseline | null
   outcome: EvaluationOutcomeSnapshot | null
   version: number
   capturedBy: string
@@ -1529,6 +1741,25 @@ export interface FinalizeEvaluationSampleReferenceRequest {
   requiredStepIntents: string[]
   forbiddenStepIntents: string[]
   expectedDisposition: EvaluationExpectedDisposition
+  humanBaseline: EvaluationHumanBaseline | null
+}
+
+export interface EvaluationNorthStarCohort {
+  count: number
+  p50Minutes: number | null
+  p95Minutes: number | null
+}
+
+/** Descriptive pilot comparison. It deliberately contains no saved-time verdict. */
+export interface EvaluationNorthStarComparison {
+  sampleCount: number
+  withHumanBaseline: number
+  measured: EvaluationNorthStarCohort
+  estimated: EvaluationNorthStarCohort
+  machineP50Ms: number | null
+  machineP95Ms: number | null
+  machineRunCount: number
+  caveats: string[]
 }
 
 export type BaselineEvaluationStatus =

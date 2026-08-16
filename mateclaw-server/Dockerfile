@@ -44,12 +44,19 @@ ARG MAVEN_FLAGS=""
 COPY mateclaw-server/settings.xml /root/.m2/settings.xml
 
 # Copy the root parent plus module POMs first for Docker layer caching.
+#
+# This list MUST mirror <modules> in the root pom.xml, even for modules this
+# image never builds. Maven fails while constructing the reactor if a declared
+# module directory is missing ("Child module /build/<name> does not exist"),
+# so `-pl mateclaw-server -am` aborts before it ever gets to dependency
+# resolution. When a module is added to the root POM, add its pom.xml here too.
 WORKDIR /build
 COPY pom.xml ./pom.xml
 COPY mateclaw-plugin-api/pom.xml mateclaw-plugin-api/pom.xml
 COPY mateclaw-server/pom.xml mateclaw-server/pom.xml
 COPY mateclaw-plugin-sample/pom.xml mateclaw-plugin-sample/pom.xml
 COPY mateclaw-plugin-search-sample/pom.xml mateclaw-plugin-search-sample/pom.xml
+COPY mateclaw-plugin-mem0/pom.xml mateclaw-plugin-mem0/pom.xml
 
 # Pre-fetch backend dependencies through the reactor so the parent POM,
 # dependencyManagement, and internal module versions all resolve consistently.
@@ -73,8 +80,13 @@ RUN mvn -pl mateclaw-server -am package -Dmaven.test.skip=true -q ${MAVEN_FLAGS}
 # bump the Java dependency, bump this tag in lockstep — Microsoft rebuilds each
 # tag with the matching driver, so mismatched versions cause the java driver to
 # re-download browsers at runtime (defeating the whole point of this image).
-FROM mcr.microsoft.com/playwright:v1.59.0-noble
+FROM mcr.microsoft.com/playwright:v1.62.0-noble
 WORKDIR /app
+
+# Immutable deployment identity. docker-compose passes the clean checkout's
+# full Git SHA as a build argument; baking it into the image avoids a mutable
+# runtime variable claiming that dirty or older code is the requested release.
+ARG MATECLAW_RELEASE_COMMIT=unknown
 
 # JDK 21 is NOT part of the base image (it ships Node for the JS driver).
 # Install openjdk-21 explicitly and add CJK fonts so Chinese pages render
@@ -121,6 +133,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     TZ=Asia/Shanghai \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
+    MATECLAW_RELEASE_COMMIT=${MATECLAW_RELEASE_COMMIT} \
     JAVA_TOOL_OPTIONS="-Duser.timezone=Asia/Shanghai -Dsun.jnu.encoding=UTF-8"
 
 # Default DB profile, overridable by the SPRING_PROFILES_ACTIVE env var

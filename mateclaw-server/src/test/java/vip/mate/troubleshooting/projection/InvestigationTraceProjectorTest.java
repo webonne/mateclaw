@@ -1,6 +1,8 @@
 package vip.mate.troubleshooting.projection;
 
 import org.junit.jupiter.api.Test;
+import vip.mate.troubleshooting.agent.OpenDiscoveryRunAudit;
+import vip.mate.troubleshooting.evidence.ScenarioEvidenceRunAudit;
 import vip.mate.troubleshooting.engine.Criterion;
 import vip.mate.troubleshooting.model.ActionType;
 import vip.mate.troubleshooting.model.AnomalyCriterion;
@@ -114,6 +116,36 @@ class InvestigationTraceProjectorTest {
     }
 
     @Test
+    void projectsTheLatestImmutableEvidenceRunTimingOnTheCollectionStage() {
+        ScenarioEvidenceRunAudit run = new ScenarioEvidenceRunAudit(
+                "scenario-evidence-run-1",
+                "diag-1",
+                new PlaybookVersionRef("playbook-903001", 3),
+                DiagnosisStatus.READY_FOR_HUMAN,
+                ConclusionType.LOCATED,
+                List.of("EV-2"),
+                CONCLUSION_AT.plusSeconds(10),
+                CONCLUSION_AT.plusSeconds(17),
+                "alice");
+
+        InvestigationTraceView view = projector.project(
+                deterministicDiagnosis(), frozenPlaybook(), derivation(), run);
+
+        InvestigationTraceView.StageView collection =
+                stage(view, InvestigationTraceView.StageKey.EVIDENCE_COLLECTION);
+        assertThat(collection.startedAt()).isEqualTo(CONCLUSION_AT.plusSeconds(10));
+        assertThat(collection.completedAt()).isEqualTo(CONCLUSION_AT.plusSeconds(17));
+        assertThat(collection.duration()).isEqualTo(Duration.ofSeconds(7));
+        assertThat(collection.fields()).anySatisfy(field -> {
+            assertThat(field.label()).isEqualTo("本次运行编号");
+            assertThat(field.value()).isEqualTo("scenario-evidence-run-1");
+        });
+        assertThat(view.investigationDuration())
+                .as("首次结论的北极星耗时不得被后续取证改写")
+                .isEqualTo(Duration.ofSeconds(164));
+    }
+
+    @Test
     void marksUnavailableFactsAsUnrecordedAndExplainsFailClosedStop() {
         InvestigationTraceView view = projector.project(abstainedDiagnosis(), null, null);
 
@@ -139,6 +171,85 @@ class InvestigationTraceProjectorTest {
         });
         assertThat(view.evidenceRelation().available()).isFalse();
         assertThat(view.evidenceRelation().emptyReason()).isEqualTo("未记录");
+    }
+
+    @Test
+    void projectsTheBoundedOpenDiscoveryPlanBudgetsAndPreciseStopReason() {
+        OpenDiscoveryRunAudit run = new OpenDiscoveryRunAudit(
+                "run-2",
+                "diag-2",
+                List.of("message_send_failed"),
+                "message_send_failed",
+                "a".repeat(64),
+                List.of("log_search", "log_trace_bundle", "contrast_sample"),
+                6,
+                6,
+                3,
+                Duration.ofSeconds(20),
+                OpenDiscoveryRunAudit.StopReason.CORE_EVIDENCE_INCOMPLETE,
+                List.of("ONLINE-LOG-SEARCH", "ONLINE-TRACE-BUNDLE"),
+                READY_AT,
+                READY_AT.plusSeconds(4),
+                "agent:88");
+
+        InvestigationTraceView view = projector.project(
+                abstainedDiagnosis(), null, null, null, run);
+
+        InvestigationTraceView.StageView route =
+                stage(view, InvestigationTraceView.StageKey.PLAYBOOK_ROUTE);
+        assertThat(route.status()).isEqualTo(InvestigationTraceView.StageStatus.COMPLETED);
+        assertThat(route.summary()).contains("受限调查").contains("message_send_failed");
+        assertThat(route.fields())
+                .anySatisfy(field -> {
+                    assertThat(field.label()).isEqualTo("本次选中的调查计划");
+                    assertThat(field.value()).isEqualTo("message_send_failed");
+                })
+                .anySatisfy(field -> {
+                    assertThat(field.label()).isEqualTo("调查计划指纹");
+                    assertThat(field.value()).isEqualTo("a".repeat(64));
+                })
+                .anySatisfy(field -> {
+                    assertThat(field.label()).isEqualTo("最多推理轮次");
+                    assertThat(field.value()).isEqualTo("6");
+                })
+                .anySatisfy(field -> {
+                    assertThat(field.label()).isEqualTo("总时长上限");
+                    assertThat(field.value()).isEqualTo("PT20S");
+                });
+
+        InvestigationTraceView.StageView contract =
+                stage(view, InvestigationTraceView.StageKey.EVIDENCE_CONTRACT);
+        assertThat(contract.status()).isEqualTo(InvestigationTraceView.StageStatus.PARTIAL);
+        assertThat(contract.summary()).contains("计划查 3 类只读数据");
+        assertThat(contract.fields()).anySatisfy(field -> {
+            assertThat(field.label()).isEqualTo("计划查询的数据");
+            assertThat(field.value())
+                    .isEqualTo("log_search → log_trace_bundle → contrast_sample");
+        });
+
+        InvestigationTraceView.StageView collection =
+                stage(view, InvestigationTraceView.StageKey.EVIDENCE_COLLECTION);
+        assertThat(collection.startedAt()).isNull();
+        assertThat(collection.completedAt()).isNull();
+        assertThat(collection.duration()).isNull();
+        assertThat(collection.fields())
+                .anySatisfy(field -> {
+                    assertThat(field.label()).isEqualTo("实际发起的只读查询");
+                    assertThat(field.value()).isEqualTo("3");
+                })
+                .anySatisfy(field -> {
+                    assertThat(field.label()).isEqualTo("只读查询上限");
+                    assertThat(field.value()).isEqualTo("6");
+                });
+        InvestigationTraceView.StageView conclusion =
+                stage(view, InvestigationTraceView.StageKey.CONCLUSION);
+        assertThat(conclusion.fields()).anySatisfy(field -> {
+            assertThat(field.label()).isEqualTo("受限调查总耗时");
+            assertThat(field.value()).isEqualTo("PT4S");
+        });
+        assertThat(view.stopReason().code())
+                .isEqualTo(InvestigationTraceView.StopReasonCode.EVIDENCE_MISSING);
+        assertThat(view.stopReason().message()).contains("核心证据链不完整");
     }
 
     @Test

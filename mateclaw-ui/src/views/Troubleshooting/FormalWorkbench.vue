@@ -11,15 +11,17 @@
       v-if="evaluationWorkspaceActive"
       :current-diagnosis-id="current?.diagnosis.diagnosisId || null"
       :current-diagnosis-status="current?.diagnosis.status || null"
+      :current-diagnosis-rehearsal="current?.diagnosis.rehearsal || false"
       :capture-context="evaluationCaptureContext"
       :replay-capture-context="replayEvaluationCaptureContextValue"
       :capture-enabled="canCaptureEvaluationSample"
       :capture-disabled-reason="evaluationCaptureDisabledReason"
       :replay-capture-enabled="canCaptureReplayEvaluationSample"
       :replay-capture-disabled-reason="replayCaptureDisabledReason"
+      :start-pilot-setup="route.query.pilotSetup === '1'"
       @back="closeCapabilityWorkspace"
       @open-diagnosis="openDiagnosisFromEvaluation"
-      @open-history-replay="openHistoricalReplay"
+      @open-validation="openCurrentEvaluationValidation"
     />
 
     <CaseKnowledgeImportWorkspace
@@ -44,9 +46,18 @@
       :loading="listLoading"
       :can-operate="canOperateTroubleshooting"
       :can-manage="canManageTroubleshooting"
+      :pilot-plan="pilotPlan"
+      :pilot-plan-loading="pilotPlanLoading"
+      :pilot-plan-error="pilotPlanError"
       @refresh="store.loadList(false)"
+      @guide="openFirstUseGuide"
       @launch="openTroubleshootingScenario"
       @open-diagnosis="openDiagnosisFromList"
+      @pilot-refresh="loadPilotPlan"
+      @pilot-setup="openPilotSetup"
+      @pilot-launch-formal="launchFormalPilotIncident"
+      @pilot-open-diagnosis="openPilotDiagnosis"
+      @pilot-open-evaluation="openPilotEvaluation"
       @switch-view="switchWorkbenchView('QUEUE')"
     />
 
@@ -69,8 +80,8 @@
     <main v-loading="detailLoading" class="work-area">
       <div v-if="!business || !developer || !current" class="detail-empty">
         <div class="empty-mark">MC</div>
-        <h1>选择一条诊断开始排障</h1>
-        <p>服务经理先看业务摘要；开发证据在同一页面按需展开。</p>
+        <h1>从粘贴告警开始</h1>
+        <p>点「发起排障」，把告警原文贴进去即可。</p>
         <el-button
           v-if="canOperateTroubleshooting || canManageTroubleshooting"
           type="primary"
@@ -83,7 +94,9 @@
       <template v-else>
         <header class="work-head">
           <div>
-            <span class="eyebrow">正式排障工作台 · Diagnosis {{ business.diagnosisId }}</span>
+            <span class="eyebrow">
+              {{ current.diagnosis.rehearsal ? '演练' : '正式排障' }}
+            </span>
             <h1>{{ business.problem }}</h1>
           </div>
           <div class="work-head-actions">
@@ -115,19 +128,35 @@
           :can-operate="canOperateTroubleshooting"
           :can-transfer="canTransfer"
           :can-close="canClose"
+          :can-evaluate="canManageTroubleshooting"
+          :rehearsal="current.diagnosis.rehearsal"
           :action-loading="actionLoading"
           :status="current.diagnosis.status"
           @confirm="store.confirmDiagnosis"
           @transfer="transferOpen = true"
           @close="closeOpen = true"
+          @evaluate="openEvaluationLedger"
         />
 
-        <MessageSendEvidenceRunCard
-          v-if="messageSendScenarioActive"
+        <details class="question-progress-fold">
+          <summary>
+            <div>
+              <b>查看排障进度</b>
+              <small>按“发生了什么 → 查到了什么 → 结论 → 人工处理”复核</small>
+            </div>
+            <span>5 个检查点</span>
+          </summary>
+          <FiveQuestionRail :items="fiveQuestionItems" />
+        </details>
+
+        <ScenarioEvidenceRunCard
+          v-if="evidenceSpineScenarioPresentation"
           :diagnosis="current.diagnosis"
           :can-operate="canOperateTroubleshooting"
-          :loading="messageSendEvidenceLoading"
-          @run="runMessageSendEvidence"
+          :loading="scenarioEvidenceLoading"
+          :scenario-name="evidenceSpineScenarioPresentation.name"
+          :failure-step="evidenceSpineScenarioPresentation.failureStep"
+          @run="runScenarioEvidence"
         />
 
         <TopologyEvidenceCard
@@ -160,20 +189,35 @@
     </main>
     </template>
 
+    <FirstUseGuideDrawer
+      v-model="firstUseGuideOpen"
+      @start="startFirstUseRehearsal"
+    />
+
     <TroubleshootingScenarioDialog
       v-model="scenarioLauncherOpen"
       :can-operate="canOperateTroubleshooting"
       :can-manage="canManageTroubleshooting"
       @select="startTroubleshootingScenario"
+      @back-to-incident="openIncidentIntake"
     />
 
     <IncidentReportDialog
       v-model="incidentReportOpen"
       v-model:form="incidentReportForm"
       :route-preview="incidentRoutePreview"
+      :open-discovery-readiness="openDiscoveryReadiness"
       :loading="incidentReportLoading"
       :can-submit="canSubmitIncidentReport"
+      @pick-scenario="openKnownScenarioPicker"
+      @pick-conversation="openConversationIntake"
       @submit="reportIncident"
+    />
+
+    <ConversationIntakeDialog
+      v-model="conversationIntakeOpen"
+      @switch-form="openIncidentIntakeFromConversation"
+      @ready="onConversationReady"
     />
 
     <MessageSendScenarioDialog
@@ -183,6 +227,15 @@
       :can-submit="canSubmitMessageSendScenario"
       @open-playbooks="openPlaybooks"
       @submit="createMessageSendScenario"
+    />
+
+    <CtiCreateConversationScenarioDialog
+      v-model="ctiCreateConversationScenarioOpen"
+      v-model:form="ctiCreateConversationScenarioForm"
+      :loading="ctiCreateConversationScenarioLoading"
+      :can-submit="canSubmitCtiCreateConversationScenario"
+      @open-playbooks="openPlaybooks"
+      @submit="createCtiCreateConversationScenario"
     />
 
     <DeploymentTopologyScenarioDialog
@@ -229,7 +282,7 @@
       @open-evaluation="openEvaluationLedger"
     />
 
-    <SynthesisPreviewDialog v-model="synthesisPreviewOpen" />
+    <SynthesisPreviewDialog v-if="!evaluationWorkspaceActive" v-model="synthesisPreviewOpen" />
 
     <TransferDialog
       v-model="transferOpen"
@@ -273,9 +326,12 @@ import {
   type EvidenceChainPreviewRequest,
   type GuanceEvidenceAcceptanceView,
   type HistoricalCaseKnowledgeImportResult,
+  type OpenDiscoveryReadiness,
   type RecommendedAction,
   type StoredDiagnosis,
   type TopologyProbeEvidenceRun,
+  type TroubleshootingPilotModuleScope,
+  type TroubleshootingPilotPlan,
 } from '@/api'
 import { useTroubleshootingStore } from '@/stores/useTroubleshootingStore'
 import { diagnosisEvidenceSourcePresentation } from './formalProjection'
@@ -306,21 +362,27 @@ import GuanceValidationDialog from './GuanceValidationDialog.vue'
 import DeploymentTopologySopDialog from './DeploymentTopologySopDialog.vue'
 import DiagnosisListView from './DiagnosisListView.vue'
 import DiagnosisQueuePanel from './DiagnosisQueuePanel.vue'
+import FirstUseGuideDrawer from './FirstUseGuideDrawer.vue'
 import TroubleshootingScenarioDialog from './TroubleshootingScenarioDialog.vue'
 import CaseKnowledgeImportWorkspace from './CaseKnowledgeImportWorkspace.vue'
 import IncidentReportDialog from './IncidentReportDialog.vue'
+import ConversationIntakeDialog from './ConversationIntakeDialog.vue'
 import MessageSendScenarioDialog from './MessageSendScenarioDialog.vue'
+import CtiCreateConversationScenarioDialog from './CtiCreateConversationScenarioDialog.vue'
 import DeploymentTopologyScenarioDialog from './DeploymentTopologyScenarioDialog.vue'
 import TransferDialog from './TransferDialog.vue'
 import ApproveActionDialog from './ApproveActionDialog.vue'
 import RecordOutcomeDialog from './RecordOutcomeDialog.vue'
 import CloseDiagnosisDialog from './CloseDiagnosisDialog.vue'
 import BusinessSummaryCard from './BusinessSummaryCard.vue'
-import MessageSendEvidenceRunCard from './MessageSendEvidenceRunCard.vue'
+import FiveQuestionRail from './FiveQuestionRail.vue'
+import { buildFiveQuestionRail } from './fiveQuestionProgress'
+import ScenarioEvidenceRunCard from './ScenarioEvidenceRunCard.vue'
 import TopologyEvidenceCard from './TopologyEvidenceCard.vue'
 import DeveloperEvidencePanel from './DeveloperEvidencePanel.vue'
 import {
   canAttachGuanceResultToDiagnosis,
+  evidenceOnboardingRequestForScope,
   type GuanceOnboardingValidationPayload,
   type GuanceValidationOrigin,
 } from './guanceOnboarding'
@@ -335,6 +397,15 @@ import {
   messageSendScenarioFormErrors,
   type MessageSendScenarioForm,
 } from './messageSendScenario'
+import {
+  CTI_CREATE_CONVERSATION_SCENARIO,
+  EMPTY_CTI_CREATE_CONVERSATION_SCENARIO,
+  buildCtiCreateConversationScenarioRequest,
+  canRunCtiCreateConversationEvidence,
+  ctiCreateConversationScenarioFormErrors,
+  isCtiCreateConversationDiagnosis,
+  type CtiCreateConversationScenarioForm,
+} from './ctiCreateConversationScenario'
 import {
   DEFAULT_CASE_KNOWLEDGE_IMPORT_LIMIT,
   caseKnowledgeImportCanSubmit,
@@ -372,14 +443,22 @@ const {
 
 const incidentReportLoading = ref(false)
 const messageSendScenarioLoading = ref(false)
-const messageSendEvidenceLoading = ref(false)
+const ctiCreateConversationScenarioLoading = ref(false)
+const scenarioEvidenceLoading = ref(false)
 const caseKnowledgeImportLoading = ref(false)
 const caseKnowledgeBasesLoading = ref(false)
 const deploymentTopologyScenarioLoading = ref(false)
+const pilotPlan = ref<TroubleshootingPilotPlan | null>(null)
+const pilotPlanLoading = ref(true)
+const pilotPlanError = ref('')
 
 const scenarioLauncherOpen = ref(false)
+const firstUseGuideOpen = ref(false)
 const incidentReportOpen = ref(false)
+const conversationIntakeOpen = ref(false)
+const openDiscoveryReadiness = ref<OpenDiscoveryReadiness | null>(null)
 const messageSendScenarioOpen = ref(false)
+const ctiCreateConversationScenarioOpen = ref(false)
 const deploymentTopologyScenarioOpen = ref(false)
 const guanceOnboardingOpen = ref(false)
 const deploymentTopologyOpen = ref(false)
@@ -392,6 +471,9 @@ const targetAction = ref<RecommendedAction | null>(null)
 const incidentReportForm = reactive<FormalIncidentForm>({ ...EMPTY_FORMAL_INCIDENT })
 const messageSendScenarioForm = reactive<MessageSendScenarioForm>({
   ...EMPTY_MESSAGE_SEND_SCENARIO,
+})
+const ctiCreateConversationScenarioForm = reactive<CtiCreateConversationScenarioForm>({
+  ...EMPTY_CTI_CREATE_CONVERSATION_SCENARIO,
 })
 type CaseKnowledgeBaseOption = {
   id: string | number
@@ -425,17 +507,25 @@ const {
   capture: captureValidationSession,
 } = useGuanceValidationDialog()
 const guanceOnboardingInitialRequest = computed<EvidenceChainPreviewRequest>(() => {
-  return currentDiagnosisEvidenceLookup.value || {
+  const base = currentDiagnosisEvidenceLookup.value || {
     system: 'CSDP',
     service: 'csdp-session-service',
     searchTerm: 'message_send_failed',
     window: '-15m',
     occurredAt: null,
   }
+  return evidenceOnboardingRequestForScope(base, {
+    system: route.query.system,
+    service: route.query.service,
+  })
 })
 const evidenceSourcePresentation = computed(() => diagnosisEvidenceSourcePresentation(
   current.value?.diagnosis.evidence ?? [],
 ))
+const fiveQuestionItems = computed(() => {
+  if (!business.value || !developer.value) return []
+  return buildFiveQuestionRail(business.value, developer.value)
+})
 const validationCanOpenCurrentEvaluationLedger = computed(() =>
   isCurrentDiagnosisValidationRequest(guanceValidationForm))
 const incidentReportErrors = computed(() => formalIncidentFormErrors(incidentReportForm))
@@ -446,8 +536,26 @@ const messageSendScenarioErrors = computed(() =>
   messageSendScenarioFormErrors(messageSendScenarioForm))
 const canSubmitMessageSendScenario = computed(() => canOperateTroubleshooting.value
   && messageSendScenarioErrors.value.length === 0)
-const messageSendScenarioActive = computed(() =>
-  isMessageSendScenarioDiagnosis(current.value?.diagnosis))
+const ctiCreateConversationScenarioErrors = computed(() =>
+  ctiCreateConversationScenarioFormErrors(ctiCreateConversationScenarioForm))
+const canSubmitCtiCreateConversationScenario = computed(() => canOperateTroubleshooting.value
+  && ctiCreateConversationScenarioErrors.value.length === 0)
+const evidenceSpineScenarioPresentation = computed(() => {
+  const diagnosis = current.value?.diagnosis
+  if (isCtiCreateConversationDiagnosis(diagnosis)) {
+    return {
+      name: CTI_CREATE_CONVERSATION_SCENARIO.name,
+      failureStep: '先用外层错误码 701018 找到失败记录和关联 ID，再在同一链路中核对 701022 与 CSP 错误。',
+    }
+  }
+  if (isMessageSendScenarioDiagnosis(diagnosis)) {
+    return {
+      name: '会话消息发送失败',
+      failureStep: '查找“消息发送失败”样本，取得可用的 PS ID。',
+    }
+  }
+  return null
+})
 const canSubmitCaseKnowledgeImport = computed(() => caseKnowledgeImportCanSubmit(
   caseKnowledgeImportForm.knowledgeBaseId,
   caseKnowledgeImportForm.limit,
@@ -498,11 +606,54 @@ async function openDiagnosisFromList(row: DiagnosisSummary) {
   await store.selectDiagnosis(row.diagnosisId, true, 'DETAIL')
 }
 
+async function loadPilotPlan() {
+  pilotPlanLoading.value = true
+  try {
+    const response = await troubleshootingApi.pilotPlan()
+    pilotPlan.value = response.data
+    pilotPlanError.value = ''
+  } catch {
+    pilotPlan.value = null
+    pilotPlanError.value = '团队试点状态暂时不可用，请稍后重试。'
+  } finally {
+    pilotPlanLoading.value = false
+  }
+}
+
+async function openPilotDiagnosis(diagnosisId: string) {
+  await store.selectDiagnosis(diagnosisId, true, 'DETAIL')
+}
+
+function launchFormalPilotIncident(scope: TroubleshootingPilotModuleScope) {
+  if (!canOperateTroubleshooting.value) return
+  resetIncidentReportForm()
+  incidentReportForm.system = scope.system
+  incidentReportForm.service = scope.service
+  incidentReportForm.rehearsal = false
+  openIncidentIntake()
+}
+
+async function openPilotEvaluation(diagnosisId: string) {
+  if (!canManageTroubleshooting.value) return
+  await store.selectDiagnosis(diagnosisId, false, 'DETAIL')
+  await router.push({
+    path: '/troubleshooting',
+    query: {
+      ...workbenchQueryWithoutCapability(),
+      view: 'detail',
+      diagnosisId,
+      capability: 'ledger',
+    },
+  })
+}
+
 function handleCapabilityCommand(command: WorkbenchCapabilityCommand) {
   if (command === 'playbooks') {
     void router.push('/troubleshooting/sops')
   } else if (command === 'observability-assets') {
     void router.push('/troubleshooting/observability-assets')
+  } else if (command === 't7-owner-contract') {
+    void router.push('/troubleshooting/t7-owner-contract')
   } else if (command === 'guance') {
     openGuanceOnboarding()
   } else if (command === 'ledger') {
@@ -592,6 +743,13 @@ function resetMessageSendScenarioForm() {
   Object.assign(messageSendScenarioForm, EMPTY_MESSAGE_SEND_SCENARIO)
 }
 
+function resetCtiCreateConversationScenarioForm() {
+  Object.assign(
+    ctiCreateConversationScenarioForm,
+    EMPTY_CTI_CREATE_CONVERSATION_SCENARIO,
+  )
+}
+
 function resetDeploymentTopologyScenarioForm() {
   Object.assign(deploymentTopologyScenarioForm, EMPTY_DEPLOYMENT_TOPOLOGY_SCENARIO)
 }
@@ -610,19 +768,115 @@ function openDeploymentTopologyScenarioIntake() {
   deploymentTopologyScenarioOpen.value = true
 }
 
-function openTroubleshootingScenario() {
+function openIncidentIntake() {
+  if (!canOperateTroubleshooting.value) return
+  scenarioLauncherOpen.value = false
+  conversationIntakeOpen.value = false
+  incidentReportOpen.value = true
+}
+
+function openIncidentIntakeFromConversation() {
+  conversationIntakeOpen.value = false
+  openIncidentIntake()
+}
+
+function openConversationIntake() {
+  if (!canOperateTroubleshooting.value) return
+  incidentReportOpen.value = false
+  scenarioLauncherOpen.value = false
+  conversationIntakeOpen.value = true
+}
+
+function openKnownScenarioPicker() {
   if (!canOperateTroubleshooting.value && !canManageTroubleshooting.value) return
+  incidentReportOpen.value = false
+  conversationIntakeOpen.value = false
   scenarioLauncherOpen.value = true
 }
 
+async function onConversationReady(payload: {
+  diagnosisId: string
+  created: boolean | null
+  rehearsal: boolean
+}) {
+  conversationIntakeOpen.value = false
+  statusFilter.value = ''
+  investigationModeFilter.value = ''
+  await store.loadList(false)
+  await store.selectDiagnosis(payload.diagnosisId)
+  if (payload.created === false) {
+    ElMessage.info('已打开既有排障单（对话入口汇合到同一张单）')
+  } else {
+    ElMessage.success(payload.rehearsal
+      ? '对话资料已齐，已生成演练排障单'
+      : '对话资料已齐，已生成正式排障单')
+  }
+}
+
+function openTroubleshootingScenario() {
+  if (canOperateTroubleshooting.value) {
+    openIncidentIntake()
+    return
+  }
+  if (canManageTroubleshooting.value) {
+    scenarioLauncherOpen.value = true
+  }
+}
+
+function openFirstUseGuide() {
+  firstUseGuideOpen.value = true
+}
+
+function startFirstUseRehearsal() {
+  firstUseGuideOpen.value = false
+  openTroubleshootingScenario()
+}
+
 function startTroubleshootingScenario(command: TroubleshootingScenarioCommand) {
-  if (command === 'message-send-failed' && canOperateTroubleshooting.value) {
+  if (command === 'cti-create-conversation-failed' && canOperateTroubleshooting.value) {
+    resetCtiCreateConversationScenarioForm()
+    ctiCreateConversationScenarioOpen.value = true
+  } else if (command === 'message-send-failed' && canOperateTroubleshooting.value) {
     resetMessageSendScenarioForm()
     messageSendScenarioOpen.value = true
   } else if (command === 'incident' && canOperateTroubleshooting.value) {
-    incidentReportOpen.value = true
+    openIncidentIntake()
   } else if (command === 'deployment' && canManageTroubleshooting.value) {
     openDeploymentTopologyScenarioIntake()
+  }
+}
+
+async function createCtiCreateConversationScenario() {
+  if (!canSubmitCtiCreateConversationScenario.value) {
+    if (ctiCreateConversationScenarioErrors.value[0]) {
+      ElMessage.warning(ctiCreateConversationScenarioErrors.value[0])
+    }
+    return
+  }
+  ctiCreateConversationScenarioLoading.value = true
+  try {
+    const request = buildCtiCreateConversationScenarioRequest(
+      ctiCreateConversationScenarioForm,
+    )
+    const { data } = await troubleshootingApi.createScenarioDiagnosis(
+      CTI_CREATE_CONVERSATION_SCENARIO.scenarioKey,
+      request,
+    )
+    ctiCreateConversationScenarioOpen.value = false
+    resetCtiCreateConversationScenarioForm()
+    statusFilter.value = ''
+    investigationModeFilter.value = ''
+    await store.loadList(false)
+    await store.selectDiagnosis(data.diagnosis.diagnosisId)
+    ElMessage.success(data.created
+      ? '排障单已创建，请在详情中开始三次只读取证'
+      : '命中五分钟幂等窗口，已打开原排障单')
+  } catch (error) {
+    ElMessage.error(
+      `CTI 场景排障单未创建：${errorText(error)} 请确认排查指南 ${CTI_CREATE_CONVERSATION_SCENARIO.selector} 已回放并审核启用。`,
+    )
+  } finally {
+    ctiCreateConversationScenarioLoading.value = false
   }
 }
 
@@ -658,10 +912,11 @@ async function createMessageSendScenario() {
   }
 }
 
-async function runMessageSendEvidence() {
+async function runScenarioEvidence() {
   const diagnosis = current.value?.diagnosis
-  if (!diagnosis || !canRunMessageSendEvidenceForDiagnosis(diagnosis)) return
-  messageSendEvidenceLoading.value = true
+  if (!diagnosis || (!canRunMessageSendEvidenceForDiagnosis(diagnosis)
+    && !canRunCtiCreateConversationEvidence(diagnosis))) return
+  scenarioEvidenceLoading.value = true
   try {
     await troubleshootingApi.runScenarioEvidence(diagnosis.diagnosisId)
     await store.reload()
@@ -669,7 +924,7 @@ async function runMessageSendEvidence() {
   } catch (error) {
     ElMessage.error(`只读取证未完成：${errorText(error)} 系统未伪造结论，排障单仍保持等待状态。`)
   } finally {
-    messageSendEvidenceLoading.value = false
+    scenarioEvidenceLoading.value = false
   }
 }
 
@@ -693,15 +948,15 @@ async function reportIncident() {
     await store.loadList(false)
     await store.selectDiagnosis(data.diagnosis.diagnosisId)
     if (data.created) {
-      ElMessage.success('排障事件已进入正式 Diagnosis 主链')
+      ElMessage.success('已生成排障单，进入详情按五问推进')
     } else {
-      ElMessage.info('命中五分钟幂等窗口，已打开既有 Diagnosis')
+      ElMessage.info('五分钟内同类事件已有排障单，已打开原单')
     }
   } catch (error) {
     const routeBoundary = incidentRoutePreview.value.tone === 'DETERMINISTIC'
-      ? '错误码未命中已审核 Playbook 时，受限未命中路径会按设计 fail-closed。'
-      : '受限只读调查未启用或未通过配置校验时会按设计 fail-closed。'
-    ElMessage.error(`上报未创建：${errorText(error)} ${routeBoundary}`)
+      ? '有错误码但未命中已审核标准方案时，系统会明确拒绝，不会瞎猜。'
+      : '没有标准方案时的兜底调查未启用或配置不合规时，系统会明确拒绝。'
+    ElMessage.error(`未生成排障单：${errorText(error)} ${routeBoundary}`)
   } finally {
     incidentReportLoading.value = false
   }
@@ -796,13 +1051,32 @@ async function openEvaluationLedger() {
   await router.push({ path: '/troubleshooting', query })
 }
 
+async function openPilotSetup() {
+  if (!canManageTroubleshooting.value) return
+  await router.push({
+    path: '/troubleshooting',
+    query: {
+      ...workbenchQueryWithoutCapability(),
+      capability: 'ledger',
+      pilotSetup: '1',
+    },
+  })
+}
+
+async function openCurrentEvaluationValidation() {
+  if (!canManageTroubleshooting.value) return
+  await router.push({ path: '/troubleshooting', query: workbenchQueryWithoutCapability() })
+  openDataSourceValidation()
+}
+
 async function prepareEvaluationWorkspace() {
   const diagnosisId = current.value?.diagnosis.diagnosisId
   if (diagnosisId) await store.loadReplayCapability(diagnosisId, store.getSelectionVersion())
 }
 
-function closeCapabilityWorkspace() {
-  void router.push({ path: '/troubleshooting', query: workbenchQueryWithoutCapability() })
+async function closeCapabilityWorkspace() {
+  await router.push({ path: '/troubleshooting', query: workbenchQueryWithoutCapability() })
+  await loadPilotPlan()
 }
 
 async function openDiagnosisFromEvaluation(diagnosisId: string) {
@@ -817,6 +1091,7 @@ function workbenchQueryWithoutCapability() {
   const query = { ...route.query }
   delete query.capability
   delete query.focus
+  delete query.pilotSetup
   return query
 }
 
@@ -893,6 +1168,24 @@ function openApprove(action: RecommendedAction) { targetAction.value = action; a
 function openOutcome(action: RecommendedAction) { targetAction.value = action; outcomeOpen.value = true }
 
 watch(
+  [incidentReportOpen, () => incidentReportForm.system, () => incidentRoutePreview.value.tone],
+  async ([open, system, tone]) => {
+    if (!open || tone !== 'BOUNDED_DISCOVERY') {
+      openDiscoveryReadiness.value = null
+      return
+    }
+    try {
+      const { data } = await troubleshootingApi.openDiscoveryReadiness({
+        ...(system.trim() ? { system: system.trim() } : {}),
+      })
+      openDiscoveryReadiness.value = data
+    } catch {
+      openDiscoveryReadiness.value = null
+    }
+  },
+)
+
+watch(
   [() => route.query.view, () => route.query.diagnosisId],
   ([queryView, diagnosisId]) => {
     const nextMode = resolveWorkbenchView(queryView, diagnosisId)
@@ -936,11 +1229,14 @@ watch(guanceOnboardingOpen, open => {
     delete query.capability
     void router.replace({ path: '/troubleshooting', query })
 })
-onMounted(() => store.loadList(isDiagnosisViewMode(viewMode.value)))
+onMounted(() => {
+  void store.loadList(isDiagnosisViewMode(viewMode.value))
+  void loadPilotPlan()
+})
 </script>
 
 <style scoped>
-.formal-workbench { --ink:var(--mc-text-primary); --muted:var(--mc-text-secondary); --line:var(--mc-border); --soft:var(--mc-bg-muted); --blue:var(--mc-primary); --green:var(--mc-success); --amber:var(--mc-warning); --red:var(--mc-danger); display:grid; grid-template-columns:clamp(236px,18vw,320px) minmax(0,1fr); width:100%; min-width:0; height:100%; overflow:hidden; color:var(--ink); background:var(--mc-bg); }
+.formal-workbench { --ink:var(--mc-text-primary); --muted:var(--mc-text-secondary); --line:var(--mc-border); --soft:var(--mc-bg-muted); --blue:var(--mc-primary); --green:var(--mc-success); --amber:var(--mc-warning); --red:var(--mc-danger); display:grid; grid-template-columns:var(--mc-ts-side-rail-width) minmax(0,1fr); width:100%; min-width:0; height:100%; overflow:hidden; color:var(--ink); background:var(--mc-bg); }
 .formal-workbench.traditional-list-mode { display:block; width:100%; overflow-y:auto; }
 .formal-workbench.full-detail-mode { grid-template-columns:minmax(0,1fr); width:100%; }
 .formal-workbench.capability-workspace-mode { display:block; width:100%; overflow:hidden; }
@@ -953,6 +1249,15 @@ onMounted(() => store.loadList(isDiagnosisViewMode(viewMode.value)))
 .work-head h1 { margin:5px 0 0; font-size:var(--mc-text-xl); letter-spacing:-.025em; } .work-head-actions { display:flex; gap:8px; }
 .fixture-banner { display:flex; align-items:center; gap:8px; width:100%; margin:0 0 16px; padding:9px 13px; border:1px solid var(--mc-warning); border-radius:var(--mc-radius-sm); color:var(--mc-status-warning-text); background:var(--mc-status-warning-bg); font-size:var(--mc-text-xs); }
 .fixture-banner span:last-child { color:var(--mc-status-warning-text); } .fixture-dot { width:7px; height:7px; border-radius:50%; background:var(--mc-warning); box-shadow:0 0 0 4px rgba(245,158,11,0.13); }
+.question-progress-fold { width:100%; margin-top:12px; border:1px solid var(--mc-border); border-radius:var(--mc-radius-sm); background:var(--mc-bg-elevated); overflow:hidden; }
+.question-progress-fold>summary { display:flex; align-items:center; gap:14px; padding:14px 18px; cursor:pointer; list-style:none; }
+.question-progress-fold>summary::-webkit-details-marker { display:none; }
+.question-progress-fold>summary>div b,.question-progress-fold>summary>div small { display:block; }
+.question-progress-fold>summary>div b { font-size:var(--mc-text-sm); }
+.question-progress-fold>summary>div small { margin-top:3px; color:var(--mc-text-secondary); font-size:var(--mc-text-xs); }
+.question-progress-fold>summary>span { margin-left:auto; color:var(--mc-text-tertiary); font-size:var(--mc-text-xs); }
+.question-progress-fold :deep(.five-question-rail) { margin:0; padding:0 18px 18px; border-top:1px solid var(--mc-border-light); }
+.question-progress-fold :deep(.fq-list) { margin-top:14px; }
 .business-card,.developer-fold { width:100%; max-width:none; margin-right:0; margin-left:0; border:1px solid var(--line); border-radius:var(--mc-radius-md); background:var(--mc-bg-elevated); box-shadow:0 8px 28px var(--mc-shadow-soft); }
 .business-card { padding:clamp(20px,3vw,36px); } .verdict-head { padding-bottom:16px; }
 .badge-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; } .conclusion-badge,.status-badge,.confidence-badge { padding:4px 9px; border:1px solid var(--line); border-radius:var(--mc-radius-lg); font-size:var(--mc-text-xs); font-weight:700; }

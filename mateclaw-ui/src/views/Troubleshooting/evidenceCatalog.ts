@@ -1,10 +1,12 @@
 import type {
   EvidenceCatalogModule,
+  EvidenceCatalogSource,
   EvidenceQueryCatalog,
   EvidenceQueryContract,
   EvidenceRouteOrigin,
   ObservabilityAsset,
   ObservabilityAssetContractOption,
+  SopSummary,
 } from '@/api'
 
 // 这里原先有两条常驻流程条文案（EVIDENCE_CATALOG_WORKFLOW / EVIDENCE_SETUP_WORKFLOW）。
@@ -43,12 +45,36 @@ export type ModuleToolSetup = {
   contract: EvidenceQueryContract | null
 }
 
+export type ModuleOnboardingStep = {
+  code: 'SOURCE' | 'ASSET' | 'TOOLS' | 'PLAYBOOK' | 'ACCEPTANCE'
+  label: string
+  state: 'DONE' | 'TODO' | 'UNKNOWN'
+  detail: string
+  action: 'source' | 'asset' | 'tools' | 'playbook' | 'acceptance'
+}
+
+export type ModuleOnboardingReadiness = {
+  status: 'READY_FOR_PILOT' | 'NEEDS_CONFIGURATION'
+  completedSteps: number
+  totalSteps: number
+  operationalPlaybooks: SopSummary[]
+  steps: ModuleOnboardingStep[]
+  nextStep: ModuleOnboardingStep | null
+}
+
 export function signalKindLabel(signalKind: string): string {
   return {
     log_search: '日志检索',
     log_trace_bundle: '链路还原',
     contrast_sample: '成功失败对照',
+    error_log_scan: '错误日志巡检',
+    monitor_event_scan: '监控告警巡检',
     k8s_workload_health: 'K8s 工作负载健康',
+    k8s_pod_status: '服务 Pod 状态',
+    k8s_node_status: '服务 Node 状态',
+    host_status: '服务主机状态',
+    log_count: '日志计数',
+    synthetic_probe: '拨测',
     k8s_health: 'K8s 健康',
     monitor_checker: '监控拨测',
     rum_error: '前端错误',
@@ -162,7 +188,7 @@ export function buildModuleToolSetups(input: {
       const checklist: ToolChecklistItem[] = [
         {
           key: 'enable',
-          label: '启用并绑定查询规则',
+          label: '启用并选择取证方法',
           detail: enabled
             ? `已绑定 ${option.contractRef}`
             : '在模块资产里勾选这条已审核规则',
@@ -203,12 +229,12 @@ export function buildModuleToolSetups(input: {
           label: '观测云数据源就绪',
           detail: input.sourceReady
             ? '端点与凭据已配置'
-            : '先到数据源联调确认端点与凭据',
+            : '先检查数据连接是否可用',
           done: input.sourceReady,
         },
         {
           key: 'trial',
-          label: '管理员只读试跑通过',
+          label: '具备管理员只读试跑条件',
           detail: trialBlocker || '可以对这条工具做只读试跑',
           done: !trialBlocker && Boolean(contract?.runnable),
         },
@@ -244,6 +270,133 @@ export function buildModuleToolSetups(input: {
       return byStatus || left.signalKind.localeCompare(right.signalKind)
         || left.contractRef.localeCompare(right.contractRef)
     })
+}
+
+/**
+ * 把一个模块的分散配置折成一张可复核的五步接入清单。
+ *
+ * 这里只使用已有服务端投影，不根据名称猜测系统、模块或 Playbook。
+ * 排障方案列表因权限不可读时保留 UNKNOWN，不能伪装成“未配置”。
+ */
+export function buildModuleOnboardingReadiness(input: {
+  entry: SetupModuleEntry
+  tools: ReadonlyArray<ModuleToolSetup>
+  sources: ReadonlyArray<EvidenceCatalogSource>
+  playbooks: ReadonlyArray<SopSummary> | null
+}): ModuleOnboardingReadiness {
+  const { entry } = input
+  const operationalPlaybooks = input.playbooks === null
+    ? []
+    : input.playbooks.filter(playbook => playbook.operational
+      && sameIdentity(playbook.system, entry.system)
+      && sameIdentity(playbook.service, entry.service))
+  const enabledTools = input.tools.filter(tool => tool.enabled)
+  const readyRealPlatforms = new Set(input.sources
+    .filter(source => source.status === 'READY' && !isRecordedReplaySource(source.platform))
+    .map(source => normalizedIdentity(source.platform)))
+  const toolRealPlatforms = enabledTools.map(tool => (tool.contract?.route.platforms || [])
+    .filter(platform => !isRecordedReplaySource(platform))
+    .filter(platform => readyRealPlatforms.has(normalizedIdentity(platform))))
+  const assetPlatformReady = Boolean(entry.asset?.platform
+    && readyRealPlatforms.has(normalizedIdentity(entry.asset.platform)))
+  const moduleRealSourceReady = enabledTools.length
+    ? toolRealPlatforms.every(platforms => platforms.length > 0)
+    : assetPlatformReady
+  const routedRealPlatforms = [...new Set(toolRealPlatforms.flat())]
+  const source: ModuleOnboardingStep = {
+    code: 'SOURCE',
+    label: '真实数据源可用',
+    state: moduleRealSourceReady ? 'DONE' : 'TODO',
+    detail: moduleRealSourceReady
+      ? `${routedRealPlatforms.length
+        ? routedRealPlatforms.join('、')
+        : entry.asset?.platform || '真实数据源'} 已就绪并被当前模块引用`
+      : enabledTools.length
+        ? '当前模块的已启用方法还没有路由到可用的真实数据源'
+        : '请先检查当前模块的数据源连接和取证路由',
+    action: 'source',
+  }
+  const workspaceAssetReady = Boolean(
+    entry.asset?.origin === 'WORKSPACE' && entry.asset.enabled,
+  )
+  const asset: ModuleOnboardingStep = {
+    code: 'ASSET',
+    label: '系统模块已登记',
+    state: workspaceAssetReady ? 'DONE' : 'TODO',
+    detail: workspaceAssetReady
+      ? `${entry.asset!.environment || '已登记环境'} · Workspace v${entry.asset!.version}`
+      : entry.asset?.origin === 'DEPLOYMENT'
+        ? '当前仍使用部署默认，请接管为 Workspace 资产'
+        : '请登记系统、模块、环境和资源范围',
+    action: 'asset',
+  }
+  const toolsReady = enabledTools.length > 0
+    && enabledTools.every(tool => tool.status === 'READY')
+  const tools: ModuleOnboardingStep = {
+    code: 'TOOLS',
+    label: '取证方法可运行',
+    state: toolsReady ? 'DONE' : 'TODO',
+    detail: toolsReady
+      ? `${enabledTools.length} 条已绑定方法具备只读试跑条件`
+      : enabledTools.length
+        ? `${enabledTools.filter(tool => tool.status === 'READY').length}/${enabledTools.length} 条已绑定方法可运行`
+        : '还没有为该模块绑定已审核的取证方法',
+    action: 'tools',
+  }
+  const playbook: ModuleOnboardingStep = input.playbooks === null
+    ? {
+        code: 'PLAYBOOK',
+        label: '排障方案已生效',
+        state: 'UNKNOWN',
+        detail: '当前账号未读取到排障方案状态',
+        action: 'playbook',
+      }
+    : {
+        code: 'PLAYBOOK',
+        label: '排障方案已生效',
+        state: operationalPlaybooks.length ? 'DONE' : 'TODO',
+        detail: operationalPlaybooks.length
+          ? `${operationalPlaybooks.length} 条已审核排障方案可命中该模块`
+          : '还没有该模块可命中的已审核排障方案',
+        action: 'playbook',
+      }
+  const accepted = entry.module?.acceptance.status === 'ACCEPTED'
+  const acceptance: ModuleOnboardingStep = {
+    code: 'ACCEPTANCE',
+    label: '负责人已确认查询口径',
+    state: accepted ? 'DONE' : 'TODO',
+    detail: accepted
+      ? `已由 ${entry.module?.acceptance.acceptedBy || '负责人'} 确认`
+      : entry.module?.acceptance.status === 'STALE'
+        ? '配置已变更，原验收失效，需重新确认'
+        : '投产前需由 Workspace 负责人确认字段、索引、时间窗和关联口径',
+    action: 'acceptance',
+  }
+  const steps = [source, asset, tools, playbook, acceptance]
+  const completedSteps = steps.filter(step => step.state === 'DONE').length
+  const nextStep = steps.find(step => step.state !== 'DONE') || null
+  return {
+    status: completedSteps === steps.length
+      ? 'READY_FOR_PILOT'
+      : 'NEEDS_CONFIGURATION',
+    completedSteps,
+    totalSteps: steps.length,
+    operationalPlaybooks,
+    steps,
+    nextStep,
+  }
+}
+
+function isRecordedReplaySource(platform: string) {
+  return normalizedIdentity(platform).startsWith('recorded-replay')
+}
+
+function normalizedIdentity(value: string | null | undefined) {
+  return (value || '').trim().toLowerCase()
+}
+
+function sameIdentity(left: string | null | undefined, right: string | null | undefined) {
+  return normalizedIdentity(left) === normalizedIdentity(right)
 }
 
 export type ModuleNextAction = {
@@ -445,6 +598,7 @@ export type ObservabilityAssetDraft = {
 
 export function assetParameterLabel(parameter: string): string {
   return {
+    probe_name: '拨测任务名（probe_name，须为 ASCII）',
     monitor_checker: '观测云监控规则标识（monitor_checker）',
     deployment: 'Kubernetes Deployment',
     namespace: 'Kubernetes Namespace',
@@ -466,7 +620,7 @@ export function observabilityAssetDraftReadiness(
     (value): value is string => typeof value === 'string' && Boolean(value.trim()),
   )
   if (draft.enabled && !bindings.length) missing.push('至少一条已审核查询规则')
-  const parameterOrder = ['namespace', 'cluster', 'region', 'deployment', 'monitor_checker']
+  const parameterOrder = ['namespace', 'cluster', 'region', 'deployment', 'probe_name', 'monitor_checker']
   const requiredParameters = [...draft.requiredAssetParameters].sort((left, right) => {
     const leftIndex = parameterOrder.indexOf(left)
     const rightIndex = parameterOrder.indexOf(right)
@@ -490,7 +644,7 @@ export function directTrialBlockReason(
 ): string {
   if (!contract) return '请先选择一条查询规则'
   if (asset !== undefined && (!asset || asset.origin !== 'WORKSPACE')) {
-    return '请先到取证接入接管为 Workspace 模块配置，再执行管理员试跑'
+    return '请先在“接入系统”中登记这个模块，再执行管理员试跑'
   }
   if (asset !== undefined && !asset?.enabled) {
     return 'Workspace 模块取证配置已停用，请先新建启用版本'
@@ -509,7 +663,7 @@ export function directTrialBlockReason(
   if (contract.parameters.some(parameter => parameter.required
     && parameter.source === 'EVIDENCE_REQUEST_TARGET'
     && resourceParameters.has(parameter.name))) {
-    return '资源范围必须先登记到取证接入，不能在试跑时临时填写'
+    return '资源范围必须先在“接入系统”中登记，不能在试跑时临时填写'
   }
   return ''
 }

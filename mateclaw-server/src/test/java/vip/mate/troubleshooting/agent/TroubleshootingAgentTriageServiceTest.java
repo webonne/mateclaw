@@ -23,7 +23,6 @@ import vip.mate.troubleshooting.model.IncidentCompleteness;
 import vip.mate.troubleshooting.model.IncidentContext;
 import vip.mate.troubleshooting.model.RouteMode;
 import vip.mate.troubleshooting.service.StoredDiagnosis;
-import vip.mate.troubleshooting.service.TroubleshootingPersistenceService;
 import vip.mate.troubleshooting.statemachine.DiagnosisStateMachine;
 
 import java.time.Clock;
@@ -39,6 +38,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -48,7 +48,6 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -61,7 +60,7 @@ class TroubleshootingAgentTriageServiceTest {
     @Mock private AgentService agentService;
     @Mock private AgentBindingService bindingService;
     @Mock private EvidenceSourceRouter evidenceRouter;
-    @Mock private TroubleshootingPersistenceService persistence;
+    @Mock private OpenDiscoveryDiagnosisPersistenceService openDiscoveryPersistence;
     @Mock private ChatStreamTracker streamTracker;
 
     private TroubleshootingAgentProperties properties;
@@ -97,7 +96,7 @@ class TroubleshootingAgentTriageServiceTest {
                 new DiagnosisStateMachine(
                         Clock.fixed(NOW, ZoneOffset.UTC),
                         prefix -> prefix + "-fixed"),
-                persistence,
+                openDiscoveryPersistence,
                 objectMapper,
                 Clock.fixed(NOW, ZoneOffset.UTC),
                 streamTracker);
@@ -106,9 +105,16 @@ class TroubleshootingAgentTriageServiceTest {
         lenient().when(agentService.getAgent(AGENT_ID)).thenReturn(agent);
         lenient().when(bindingService.getBoundToolNames(AGENT_ID))
                 .thenReturn(Set.of(TroubleshootingEvidenceTool.BINDING_NAME));
-        lenient().when(persistence.createOrGet(anyLong(), any(Diagnosis.class), any()))
+        lenient().when(openDiscoveryPersistence.persist(
+                        anyLong(), any(Diagnosis.class), any(), any(),
+                        any(),
+                        any(OpenDiscoveryRunAudit.class)))
                 .thenAnswer(invocation ->
                         new StoredDiagnosis(invocation.getArgument(1), 0, true));
+        lenient().when(openDiscoveryPersistence.reserve(
+                        anyLong(), any(IncidentContext.class), any(Boolean.class),
+                        any(), any(), any()))
+                .thenReturn(OpenDiscoveryRunReservation.unclaimed());
     }
 
     @Test
@@ -181,6 +187,58 @@ class TroubleshootingAgentTriageServiceTest {
         verify(agentService).chatWithToolAllowlist(
                 eq(AGENT_ID), any(), any(), any(ChatOrigin.class),
                 eq(Set.of(TroubleshootingEvidenceTool.FUNCTION_NAME)));
+    }
+
+    @Test
+    void persistsTheBoundedOpenDiscoveryRunThatActuallyExecuted() {
+        when(evidenceRouter.collect(
+                eq(WORKSPACE_ID), any(EvidenceRequest.class), any(IncidentContext.class),
+                eq(Set.of("recorded-replay"))))
+                .thenAnswer(invocation -> spineEvidence(invocation.getArgument(1)));
+        when(agentService.chatWithToolAllowlist(
+                eq(AGENT_ID), any(), any(), any(ChatOrigin.class),
+                eq(Set.of(TroubleshootingEvidenceTool.FUNCTION_NAME))))
+                .thenAnswer(invocation -> {
+                    collectApprovedSpine(invocation.getArgument(2));
+                    return """
+                            {"summary":"已取得可复核线索","hypothesis":"消息发送链路异常",
+                             "confidence":"MEDIUM","abstain":false,
+                             "evidenceQueryIds":["ONLINE-LOG-SEARCH","ONLINE-TRACE-BUNDLE",
+                             "ONLINE-CONTRAST-SAMPLE"]}
+                            """;
+                });
+
+        StoredDiagnosis stored = service.triage(
+                WORKSPACE_ID, incident(), List.of(), false, "no deterministic route");
+
+        var auditCaptor = org.mockito.ArgumentCaptor.forClass(OpenDiscoveryRunAudit.class);
+        verify(openDiscoveryPersistence).persist(
+                eq(WORKSPACE_ID), eq(stored.diagnosis()), any(), eq(null), eq(null),
+                auditCaptor.capture());
+        OpenDiscoveryRunAudit audit = auditCaptor.getValue();
+        assertThat(audit.diagnosisId()).isEqualTo(stored.diagnosis().diagnosisId());
+        assertThat(audit.runId()).isEqualTo(stored.diagnosis().runId());
+        assertThat(audit.visibleScenarioKeys()).containsExactly("message_send_failed");
+        assertThat(audit.selectedScenarioKey()).isEqualTo("message_send_failed");
+        assertThat(audit.selectedPlanFingerprint())
+                .matches("[a-f0-9]{64}");
+        assertThat(audit.plannedSignalKinds()).containsExactly(
+                "log_search", "log_trace_bundle", "contrast_sample");
+        assertThat(audit.maxIterations())
+                .as("the audit must freeze the selected Agent's effective budget")
+                .isEqualTo(4);
+        assertThat(audit.maxEvidenceRequests()).isEqualTo(6);
+        assertThat(audit.sourceRequestCount()).isEqualTo(3);
+        assertThat(audit.timeBudget()).isEqualTo(Duration.ofSeconds(20));
+        assertThat(audit.stopReason())
+                .isEqualTo(OpenDiscoveryRunAudit.StopReason.VERIFIABLE_HYPOTHESIS);
+        assertThat(audit.evidenceRefs()).containsExactly(
+                TroubleshootingEvidenceSessionRegistry.ONLINE_SEARCH_REQUEST_ID,
+                TroubleshootingEvidenceSessionRegistry.ONLINE_TRACE_REQUEST_ID,
+                TroubleshootingEvidenceSessionRegistry.ONLINE_CONTRAST_REQUEST_ID);
+        assertThat(audit.startedAt()).isEqualTo(NOW);
+        assertThat(audit.completedAt()).isEqualTo(NOW);
+        assertThat(audit.actorRef()).isEqualTo("agent:" + AGENT_ID);
     }
 
     @Test
@@ -438,7 +496,7 @@ class TroubleshootingAgentTriageServiceTest {
                 .satisfies(error -> assertThat(((MateClawException) error).getCode()).isEqualTo(409))
                 .hasMessageContaining("native search disabled");
 
-        verifyNoInteractions(persistence);
+        verifyNoDiscoveryPersisted();
     }
 
     @Test
@@ -455,7 +513,7 @@ class TroubleshootingAgentTriageServiceTest {
                 .satisfies(error -> assertThat(((MateClawException) error).getCode()).isEqualTo(409))
                 .hasMessageContaining("missing API key");
 
-        verifyNoInteractions(persistence);
+        verifyNoDiscoveryPersisted();
     }
 
     @Test
@@ -472,7 +530,7 @@ class TroubleshootingAgentTriageServiceTest {
                 .satisfies(error -> assertThat(((MateClawException) error).getCode()).isEqualTo(409))
                 .hasMessageContaining("required tools unavailable");
 
-        verifyNoInteractions(persistence);
+        verifyNoDiscoveryPersisted();
     }
 
     @Test
@@ -493,7 +551,7 @@ class TroubleshootingAgentTriageServiceTest {
         assertThat(elapsed).isLessThan(Duration.ofMillis(200));
         assertThat(diagnosis.abstained()).isTrue();
         assertThat(diagnosis.warnings())
-                .anyMatch(warning -> warning.contains("时长预算"));
+                .anyMatch(warning -> warning.contains("助手超时"));
         verify(streamTracker).requestStop(any());
     }
 
@@ -502,10 +560,15 @@ class TroubleshootingAgentTriageServiceTest {
         properties.setTriageTimeout(Duration.ofMillis(80));
         CountDownLatch evidenceStarted = new CountDownLatch(1);
         CountDownLatch releaseEvidence = new CountDownLatch(1);
+        CountDownLatch unexpectedSecondCall = new CountDownLatch(1);
+        AtomicInteger sourceCalls = new AtomicInteger();
         when(evidenceRouter.collect(
                 eq(WORKSPACE_ID), any(EvidenceRequest.class), any(IncidentContext.class),
                 eq(Set.of("recorded-replay"))))
                 .thenAnswer(invocation -> {
+                    if (sourceCalls.incrementAndGet() > 1) {
+                        unexpectedSecondCall.countDown();
+                    }
                     evidenceStarted.countDown();
                     boolean released = false;
                     while (!released) {
@@ -533,11 +596,21 @@ class TroubleshootingAgentTriageServiceTest {
 
             assertThat(diagnosis.abstained()).isTrue();
             assertThat(diagnosis.warnings())
-                    .anyMatch(warning -> warning.contains("时长预算"));
+                    .anyMatch(warning -> warning.contains("助手超时"));
+            var auditCaptor = org.mockito.ArgumentCaptor.forClass(
+                    OpenDiscoveryRunAudit.class);
+            verify(openDiscoveryPersistence).persist(
+                    eq(WORKSPACE_ID), eq(diagnosis), any(), eq(null), eq(null),
+                    auditCaptor.capture());
+            assertThat(auditCaptor.getValue().sourceRequestCount()).isEqualTo(1);
         } finally {
             releaseEvidence.countDown();
             caller.shutdownNow();
         }
+        assertThat(unexpectedSecondCall.await(200, TimeUnit.MILLISECONDS)).isFalse();
+        assertThat(sourceCalls.get())
+                .as("a timed-out search must not continue into trace or contrast")
+                .isEqualTo(1);
     }
 
     @Test
@@ -551,7 +624,7 @@ class TroubleshootingAgentTriageServiceTest {
 
         verify(agentService, never()).chatWithToolAllowlist(
                 anyLong(), any(), any(), any(), any());
-        verifyNoInteractions(persistence);
+        verifyNoDiscoveryPersisted();
     }
 
     @Test
@@ -667,7 +740,7 @@ class TroubleshootingAgentTriageServiceTest {
                 .hasMessageContaining("limits are not configured");
 
         verify(agentService, never()).chatWithToolAllowlist(anyLong(), any(), any(), any(), any());
-        verifyNoInteractions(persistence);
+        verifyNoDiscoveryPersisted();
     }
 
     @Test
@@ -681,7 +754,7 @@ class TroubleshootingAgentTriageServiceTest {
 
         verify(agentService, never()).chatWithToolAllowlist(
                 anyLong(), any(), any(), any(), any());
-        verifyNoInteractions(persistence);
+        verifyNoDiscoveryPersisted();
     }
 
     @Test
@@ -695,7 +768,7 @@ class TroubleshootingAgentTriageServiceTest {
                 .hasMessageContaining("read-only tool binding");
 
         verify(agentService, never()).chatWithToolAllowlist(anyLong(), any(), any(), any(), any());
-        verifyNoInteractions(persistence);
+        verifyNoDiscoveryPersisted();
     }
 
     @Test
@@ -711,7 +784,7 @@ class TroubleshootingAgentTriageServiceTest {
                 .hasMessageContaining("workspace-local");
 
         verify(agentService, never()).chatWithToolAllowlist(anyLong(), any(), any(), any(), any());
-        verifyNoInteractions(persistence);
+        verifyNoDiscoveryPersisted();
     }
 
     @Test
@@ -724,6 +797,41 @@ class TroubleshootingAgentTriageServiceTest {
                 .hasMessageContaining("disabled");
 
         verify(agentService, never()).chatWithToolAllowlist(anyLong(), any(), any(), any(), any());
+        verify(openDiscoveryPersistence).release(WORKSPACE_ID, null);
+        verifyNoDiscoveryPersisted();
+    }
+
+    @Test
+    void returnsTheAtomicallyClaimedExistingDiagnosisBeforeAgentOrEvidenceRuns() {
+        Diagnosis existing = new DiagnosisStateMachine(
+                Clock.fixed(NOW, ZoneOffset.UTC), prefix -> prefix + "-existing")
+                .initializeAgentFallback(new vip.mate.troubleshooting.model.AgentTriageDraft(
+                        "diag-existing", "case-existing", "run-existing", incident(),
+                        List.of(), List.of(), "已有调查", "不重复执行",
+                        vip.mate.troubleshooting.model.Confidence.LOW, true,
+                        vip.mate.troubleshooting.model.NorthStarTimings.concluded(NOW, NOW, NOW),
+                        false, false, List.of()));
+        StoredDiagnosis stored = new StoredDiagnosis(existing, 2, false);
+        when(openDiscoveryPersistence.reserve(
+                eq(WORKSPACE_ID), any(IncidentContext.class), eq(false),
+                eq(NOW), eq(null), any()))
+                .thenReturn(OpenDiscoveryRunReservation.completed(stored));
+
+        StoredDiagnosis result = service.triage(
+                WORKSPACE_ID, incident(), List.of(), false, "unknown route");
+
+        assertThat(result).isSameAs(stored);
+        verify(agentService, never()).getAgent(anyLong());
+        verify(agentService, never()).chatWithToolAllowlist(
+                anyLong(), any(), any(), any(), any());
+        verify(openDiscoveryPersistence, never()).persist(
+                anyLong(), any(), any(), any(), any(), any());
+    }
+
+    private void verifyNoDiscoveryPersisted() {
+        verify(openDiscoveryPersistence, never()).persist(
+                anyLong(), any(Diagnosis.class), any(), any(), any(),
+                any(OpenDiscoveryRunAudit.class));
     }
 
     private AgentEntity configuredAgent() {

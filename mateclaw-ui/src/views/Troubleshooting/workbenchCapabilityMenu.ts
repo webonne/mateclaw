@@ -5,30 +5,69 @@ import {
 import { EVIDENCE_SYNTHESIS_FOCUS } from './synthesisPreview'
 
 export type WorkbenchOverlayCapability = 'guance' | 'ledger' | 'case-knowledge'
+export type EvidenceSetupSection = 'modules' | 'tools' | 'source'
 
 export type WorkbenchCapabilityNavItem = {
+  key: string
   command: WorkbenchCapabilityCommand
   label: string
+  description: string
+  section?: EvidenceSetupSection
+  /** Route/nav gate; defaults to manage:troubleshooting for config pages. */
+  requiredCapability?: 'view:troubleshooting' | 'operate:troubleshooting' | 'manage:troubleshooting'
 }
 
 export type WorkbenchCapabilityNavGroup = {
-  key: 'configuration' | 'learning'
+  key: 'advanced' | 'learning'
   label: string
   items: ReadonlyArray<WorkbenchCapabilityNavItem>
 }
 
+export const WORKBENCH_PRIMARY_CAPABILITIES: ReadonlyArray<WorkbenchCapabilityNavItem> = [
+  {
+    key: 'evidence-modules',
+    command: 'observability-assets',
+    section: 'modules',
+    label: '接入系统',
+    description: '登记系统模块，并在模块里选择取证方法',
+    requiredCapability: 'manage:troubleshooting',
+  },
+  {
+    key: 't7-owner-contract',
+    command: 't7-owner-contract',
+    label: '标准查登记',
+    description: '登记首批 20 条重点故障怎么查（准备材料，不等于验收）',
+    requiredCapability: 'view:troubleshooting',
+  },
+]
+
 export const WORKBENCH_CAPABILITY_GROUPS: ReadonlyArray<WorkbenchCapabilityNavGroup> = [
   {
-    key: 'configuration',
-    label: '配置与接入',
+    key: 'advanced',
+    label: '更多配置',
     items: [
       {
+    key: 'evidence-tools',
+    command: 'observability-assets',
+    section: 'tools',
+    label: '取证方法',
+    description: '维护方法库（可设通用或指定系统/模块），再在接入系统里选用',
+    requiredCapability: 'manage:troubleshooting',
+  },
+      {
+        key: 'evidence-source',
         command: 'observability-assets',
-        label: TROUBLESHOOTING_UI_LABELS.observabilityAssets,
+        section: 'source',
+        label: '数据连接',
+        description: '检查观测云能否正常读取',
+        requiredCapability: 'manage:troubleshooting',
       },
       {
+        key: 'playbooks',
         command: 'playbooks',
         label: TROUBLESHOOTING_UI_LABELS.rules,
+        description: '场景、步骤与判断标准',
+        requiredCapability: 'manage:troubleshooting',
       },
     ],
   },
@@ -37,22 +76,46 @@ export const WORKBENCH_CAPABILITY_GROUPS: ReadonlyArray<WorkbenchCapabilityNavGr
     label: '复盘与沉淀',
     items: [
       {
+        key: 'ledger',
         command: 'ledger',
         label: TROUBLESHOOTING_UI_LABELS.evaluation,
+        description: '用真实样本验证效果',
+        requiredCapability: 'manage:troubleshooting',
       },
       {
+        key: 'case-knowledge',
         command: 'case-knowledge',
         label: TROUBLESHOOTING_UI_LABELS.caseKnowledge,
+        description: '沉淀已解决的故障',
+        requiredCapability: 'manage:troubleshooting',
       },
     ],
   },
 ]
+
+export const EVIDENCE_SETUP_SECTIONS: ReadonlyArray<{
+  key: EvidenceSetupSection
+  label: string
+  description: string
+}> = [
+  { key: 'modules', label: '接入系统', description: '登记要排障的系统和模块；点进模块即可勾选取证方法、查看数据源缺口并试跑。' },
+  { key: 'tools', label: '取证方法', description: '方法库：配置查什么、要哪些参数、作用域是通用还是指定系统/模块；查询模板由管理员维护。' },
+  { key: 'source', label: '数据连接', description: '检查系统能否只读访问观测云并正常获取排障数据。' },
+]
+
+export function normalizeEvidenceSetupSection(value: unknown): EvidenceSetupSection {
+  const candidate = firstQueryValue(value)
+  return candidate === 'tools' || candidate === 'source' ? candidate : 'modules'
+}
 
 const WORKBENCH_OVERLAY_CAPABILITIES = new Set<WorkbenchOverlayCapability>([
   'guance',
   'ledger',
   'case-knowledge',
 ])
+
+const PILOT_MEMBER_SOURCE = 'troubleshooting-pilot'
+const DEFAULT_PILOT_SETUP_RETURN = '/troubleshooting?view=list&capability=ledger&pilotSetup=1'
 
 function firstQueryValue(value: unknown): unknown {
   return Array.isArray(value) ? value[0] : value
@@ -63,6 +126,23 @@ export function safeTroubleshootingReturnPath(value: unknown): string | null {
   if (typeof candidate !== 'string') return null
   if (!/^\/troubleshooting(?:[?#]|$)/.test(candidate)) return null
   return candidate
+}
+
+export function pilotMemberSettingsLocation(
+  preferredReturnPath?: unknown,
+): { path: string; query: Record<string, string> } {
+  return {
+    path: '/settings/members',
+    query: {
+      source: PILOT_MEMBER_SOURCE,
+      returnTo: safeTroubleshootingReturnPath(preferredReturnPath) || DEFAULT_PILOT_SETUP_RETURN,
+    },
+  }
+}
+
+export function pilotMemberReturnPath(source: unknown, returnTo: unknown): string | null {
+  if (firstQueryValue(source) !== PILOT_MEMBER_SOURCE) return null
+  return safeTroubleshootingReturnPath(returnTo)
 }
 
 export function normalizeWorkbenchOverlayCapability(
@@ -112,6 +192,7 @@ export function legacyEvidenceSynthesisLocation(
 export function observabilityAssetsLocation(
   scope?: { system?: string; service?: string },
   currentFullPath?: string,
+  section?: EvidenceSetupSection,
 ): { path: string; query: Record<string, string> } {
   const returnTo = safeTroubleshootingReturnPath(currentFullPath)
   return {
@@ -119,6 +200,19 @@ export function observabilityAssetsLocation(
     query: {
       ...(scope?.system ? { system: scope.system } : {}),
       ...(scope?.service ? { service: scope.service } : {}),
+      ...(section ? { section } : {}),
+      ...(returnTo ? { returnTo } : {}),
+    },
+  }
+}
+
+export function t7OwnerContractLocation(
+  currentFullPath?: string,
+): { path: string; query: Record<string, string> } {
+  const returnTo = safeTroubleshootingReturnPath(currentFullPath)
+  return {
+    path: '/troubleshooting/t7-owner-contract',
+    query: {
       ...(returnTo ? { returnTo } : {}),
     },
   }

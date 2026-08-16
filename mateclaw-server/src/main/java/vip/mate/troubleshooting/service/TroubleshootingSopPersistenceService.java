@@ -151,7 +151,7 @@ public class TroubleshootingSopPersistenceService {
             query.eq(TroubleshootingSopEntity::getStatus, status.trim());
         }
         if (system != null && !system.isBlank()) {
-            query.eq(TroubleshootingSopEntity::getSystem, system.trim());
+            query.eq(TroubleshootingSopEntity::getSystemName, system.trim());
         }
         return mapper.selectList(query);
     }
@@ -214,7 +214,8 @@ public class TroubleshootingSopPersistenceService {
                 current.service(), current.title(), current.cause(), current.category(),
                 current.ownerTeam(), target, "approved".equals(target),
                 current.evidenceRequests(), current.anomalyCriteria(),
-                current.diagnosisRules(), current.actions());
+                current.diagnosisRules(), current.actions(),
+                current.symptomTriggers());
 
         TroubleshootingSopEntity patch = new TroubleshootingSopEntity();
         patch.setStatus(updated.status());
@@ -246,6 +247,41 @@ public class TroubleshootingSopPersistenceService {
         }
         TroubleshootingSopEntity entity = findOperationalEntity(workspaceId, routeKey);
         return entity == null ? null : read(entity);
+    }
+
+    /**
+     * Resolves a missing system only when one operational route matches the
+     * already structured service and explicit error code.
+     *
+     * <p>This is intentionally not fuzzy text routing. Ambiguous/no matches
+     * stay empty so Intake can ask the reporter instead of elevating a guess to
+     * deterministic Playbook authority.</p>
+     */
+    public java.util.Optional<String> findUniqueOperationalSystem(
+            long workspaceId, String service, String errorCode) {
+        if (workspaceId <= 0 || service == null || service.isBlank()
+                || errorCode == null || errorCode.isBlank()) {
+            return java.util.Optional.empty();
+        }
+        return playbookVersions.uniqueActiveSystemForExactRoute(
+                workspaceId, service.trim(), errorCode.trim());
+    }
+
+    /**
+     * Resolves a missing system for an alert that names a service but carries
+     * no error code, and only when exactly one operational route claims that
+     * service.
+     *
+     * <p>Monitoring alerts are the normal case here: 「服务：csdp-wechat」without
+     * any code. The same anti-guessing rule applies — several owning systems
+     * leave this empty rather than picking one.</p>
+     */
+    public java.util.Optional<String> findUniqueOperationalSystemForService(
+            long workspaceId, String service) {
+        if (workspaceId <= 0 || service == null || service.isBlank()) {
+            return java.util.Optional.empty();
+        }
+        return playbookVersions.uniqueActiveSystemForService(workspaceId, service.trim());
     }
 
     /** Reads the latest contract for governance UI, including candidate/deprecated. */

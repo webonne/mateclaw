@@ -203,7 +203,10 @@ class EvidenceAutoConfigurationTest {
                             .containsEntry("contrast_sample", List.of("guance"))
                             .containsEntry("error_log_scan", List.of("guance"))
                             .containsEntry("monitor_event_scan", List.of("guance"))
-                            .containsEntry("k8s_workload_health", List.of("guance"));
+                            .containsEntry("k8s_workload_health", List.of("guance"))
+                            .containsEntry("k8s_pod_status", List.of("guance"))
+                            .containsEntry("k8s_node_status", List.of("guance"))
+                            .containsEntry("host_status", List.of("guance"));
 
                     EvidenceProperties.Guance guance = properties.getGuance();
                     assertThat(guance.isEnabled()).isFalse();
@@ -213,8 +216,14 @@ class EvidenceAutoConfigurationTest {
                     assertThat(guance.getTimeout()).isEqualTo(java.time.Duration.ofSeconds(45));
                     assertThat(context.getBean(EvidenceHttpTransport.class))
                             .isInstanceOf(NativeCurlEvidenceHttpTransport.class);
-                    assertThat(guance.getAssetBindings()).singleElement()
-                            .satisfies(asset -> {
+                    assertThat(guance.getBindings())
+                            .containsKeys(
+                                    "guance-service-pod-status",
+                                    "guance-service-node-status",
+                                    "guance-service-host-status",
+                                    "csdp-k8s-workload-health");
+                    assertThat(guance.getAssetBindings()).hasSize(3);
+                    assertThat(guance.getAssetBindings().get(0)).satisfies(asset -> {
                                 assertThat(asset.getWorkspaceId()).isEqualTo(1L);
                                 assertThat(asset.getSystem()).isEqualTo("CSDP");
                                 assertThat(asset.getService()).isEqualTo("csdp-session-service");
@@ -234,8 +243,47 @@ class EvidenceAutoConfigurationTest {
                                                 "csdp-monitor-event-scan")
                                         .containsEntry(
                                                 "k8s_workload_health",
-                                                "csdp-k8s-workload-health");
+                                                "csdp-k8s-workload-health")
+                                        .containsEntry(
+                                                "k8s_pod_status",
+                                                "guance-service-pod-status")
+                                        .containsEntry(
+                                                "k8s_node_status",
+                                                "guance-service-node-status")
+                                        .containsEntry(
+                                                "host_status",
+                                                "guance-service-host-status");
                             });
+                    assertThat(guance.getAssetBindings().get(1)).satisfies(asset -> {
+                        assertThat(asset.getWorkspaceId()).isEqualTo(1L);
+                        assertThat(asset.getSystem()).isEqualTo("CSDP");
+                        assertThat(asset.getService()).isEqualTo("csdp-task");
+                        assertThat(asset.getSignalBindings())
+                                .containsEntry(
+                                        "log_search",
+                                        "csdp-cti-create-conversation-log-search")
+                                .containsEntry(
+                                        "log_trace_bundle",
+                                        "csdp-cti-create-conversation-trace-bundle")
+                                .containsEntry(
+                                        "contrast_sample",
+                                        "csdp-cti-create-conversation-contrast");
+                    });
+                    assertThat(guance.getAssetBindings().get(2)).satisfies(asset -> {
+                        assertThat(asset.getWorkspaceId()).isEqualTo(1L);
+                        assertThat(asset.getSystem()).isEqualTo("CSDP");
+                        assertThat(asset.getService()).isEqualTo("csdp-wechat");
+                        assertThat(asset.getSignalBindings())
+                                .containsEntry(
+                                        "log_search",
+                                        "csdp-itgw-access-log-search")
+                                .containsEntry(
+                                        "log_trace_bundle",
+                                        "csdp-itgw-access-trace-bundle")
+                                .containsEntry(
+                                        "contrast_sample",
+                                        "csdp-itgw-access-contrast");
+                    });
 
                     assertThat(guance.getBindings())
                             .containsKeys(
@@ -244,15 +292,104 @@ class EvidenceAutoConfigurationTest {
                                     "csdp-message-send-contrast",
                                     "csdp-application-error-scan",
                                     "csdp-monitor-event-scan",
-                                    "csdp-k8s-workload-health");
+                                    "csdp-k8s-workload-health",
+                                    "csdp-cti-create-conversation-log-search",
+                                    "csdp-cti-create-conversation-trace-bundle",
+                                    "csdp-cti-create-conversation-contrast",
+                                    "csdp-itgw-access-log-search",
+                                    "csdp-itgw-access-trace-bundle",
+                                    "csdp-itgw-access-contrast");
+                    EvidenceProperties.Binding ctiSearch = guance.getBindings()
+                            .get("csdp-cti-create-conversation-log-search");
+                    assertThat(ctiSearch.getQueryTemplate())
+                            .contains(
+                                    "csdp-task",
+                                    "@code",
+                                    "701018",
+                                    "@trace_id")
+                            .doesNotContain("{{window_span}}")
+                            .doesNotContain("{{search_term}}");
+                    assertThat(ctiSearch.getQueryOptions()).satisfies(options -> {
+                        assertThat(options.getMaxPointCount()).isEqualTo(1);
+                        assertThat(options.getInterval()).isEqualTo(900);
+                        assertThat(options.isAlignTime()).isFalse();
+                    });
+                    EvidenceProperties.Binding ctiTrace = guance.getBindings()
+                            .get("csdp-cti-create-conversation-trace-bundle");
+                    assertThat(ctiTrace.getQueryTemplate())
+                            .contains("csdp-task", "{{ps_id}}")
+                            .doesNotContain("{{search_term}}");
+                    assertThat(ctiTrace.getFieldAliases())
+                            .containsEntry("message@trace_id", "ps_id")
+                            .containsEntry("message@level", "level")
+                            .containsEntry("message@msg", "message");
+                    EvidenceProperties.Binding ctiContrast = guance.getBindings()
+                            .get("csdp-cti-create-conversation-contrast");
+                    assertThat(ctiContrast.getQueryTemplates()).hasSize(4);
+                    assertThat(ctiContrast.getQueryTemplates().get(0))
+                            .contains("{{exclude_ps_id}}", "query_string");
+                    assertThat(ctiContrast.getQueryTemplates().get(1))
+                            .contains("{{exclude_ps_id}}", "@code", "701022");
+                    assertThat(ctiContrast.getQueryTemplates().get(2))
+                            .contains("@msg", "errCode", "@stack_trace", "CreateConversation");
+                    assertThat(ctiContrast.getQueryTemplates())
+                            .allMatch(query -> !query.contains("{{window_span}}"));
+                    assertThat(ctiContrast.getQueryOptions()).satisfies(options -> {
+                        assertThat(options.getMaxPointCount()).isEqualTo(1);
+                        assertThat(options.getInterval()).isEqualTo(900);
+                        assertThat(options.isAlignTime()).isFalse();
+                    });
+                    assertThat(ctiContrast.getConstantFields())
+                            .containsEntry(
+                                    "discriminating_feature",
+                                    "inner_701022_on_failed_trace");
+                    EvidenceProperties.Binding itgwSearch = guance.getBindings()
+                            .get("csdp-itgw-access-log-search");
+                    assertThat(itgwSearch.getQueryTemplate())
+                            .contains("csdp-wechat", "@code", "904003", "@trace_id")
+                            .doesNotContain("{{window_span}}", "{{search_term}}");
+                    assertThat(itgwSearch.getQueryOptions()).satisfies(options -> {
+                        assertThat(options.getMaxPointCount()).isEqualTo(1);
+                        assertThat(options.getInterval()).isEqualTo(900);
+                        assertThat(options.isAlignTime()).isFalse();
+                    });
+                    EvidenceProperties.Binding itgwTrace = guance.getBindings()
+                            .get("csdp-itgw-access-trace-bundle");
+                    assertThat(itgwTrace.getQueryTemplate())
+                            .contains("csdp-wechat", "{{ps_id}}")
+                            .doesNotContain("{{search_term}}");
+                    assertThat(itgwTrace.getFieldAliases())
+                            .containsEntry("message@trace_id", "ps_id")
+                            .containsEntry("message@level", "level")
+                            .containsEntry("message@msg", "message");
+                    EvidenceProperties.Binding itgwContrast = guance.getBindings()
+                            .get("csdp-itgw-access-contrast");
+                    assertThat(itgwContrast.getQueryTemplates()).hasSize(4);
+                    assertThat(itgwContrast.getQueryTemplates().get(0))
+                            .contains("csdp-wechat", "904003");
+                    assertThat(itgwContrast.getQueryTemplates().get(1))
+                            .contains("csdp-wechat", "904003", "敏感词");
+                    assertThat(itgwContrast.getQueryTemplates().get(2))
+                            .contains("csdp-wechat", "workOrderPhase", "StatusCode");
+                    assertThat(itgwContrast.getQueryTemplates().get(3))
+                            .contains("csdp-wechat", "workOrderPhase", "StatusCode", "敏感词");
+                    assertThat(itgwContrast.getQueryOptions()).satisfies(options -> {
+                        assertThat(options.getMaxPointCount()).isEqualTo(1);
+                        assertThat(options.getInterval()).isEqualTo(900);
+                        assertThat(options.isAlignTime()).isFalse();
+                    });
+                    assertThat(itgwContrast.getConstantFields())
+                            .containsEntry(
+                                    "discriminating_feature",
+                                    "itgw_content_policy_blocked");
                     assertThat(guance.getBindings().get("csdp-message-send-log-search")
                             .getQueryTemplate())
                             .contains(
                                     "csp-rpc-msg",
                                     "query_string",
                                     "failed AND sendmsg",
-                                    "@trace_id",
-                                    "{{window_span}}");
+                                    "@trace_id")
+                            .doesNotContain("{{window_span}}");
                     assertThat(guance.getBindings().get("csdp-message-send-log-search")
                             .getQuestion()).contains("SendMsg 失败请求");
                     EvidenceProperties.Binding traceBinding = guance.getBindings()
@@ -274,21 +411,22 @@ class EvidenceAutoConfigurationTest {
                     assertThat(contrastBinding.getQueryTemplates())
                             .hasSize(4)
                             .allSatisfy(query -> assertThat(query)
-                                    .contains("count_distinct", "@trace_id", "{{window_span}}"));
+                                    .contains("count_distinct", "@trace_id")
+                                    .doesNotContain("{{window_span}}"));
                     assertThat(contrastBinding.getQueryTemplates().get(0))
                             .contains("failed AND sendmsg");
                     assertThat(contrastBinding.getQueryTemplates().get(1))
-                            .contains("failed AND sendmsg", "message_length = 2875");
+                            .contains("failed AND sendmsg", "message_length = 2011");
                     assertThat(contrastBinding.getQueryTemplates().get(2))
                             .contains("success AND sendmsg AND NOT failed");
                     assertThat(contrastBinding.getQueryTemplates().get(3))
                             .contains(
                                     "success AND sendmsg AND NOT failed",
-                                    "message_length = 2875");
+                                    "message_length = 2011");
                     assertThat(contrastBinding.getConstantFields())
                             .containsEntry(
                                     "discriminating_feature",
-                                    "message_length_eq_2875");
+                                    "message_length_eq_2011");
                     EvidenceProperties.Binding errorScan = guance.getBindings()
                             .get("csdp-application-error-scan");
                     assertThat(errorScan.getNamespace()).isEqualTo("L");

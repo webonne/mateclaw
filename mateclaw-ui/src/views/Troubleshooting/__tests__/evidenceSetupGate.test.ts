@@ -1,14 +1,17 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
+import { createPinia } from 'pinia'
 import type { EvidenceQueryCatalog, ObservabilityAssetCatalog } from '@/api'
 
 const evidenceCatalog = vi.fn()
 const observabilityAssets = vi.fn()
+const evidenceContracts = vi.fn()
 
 vi.mock('@/api', () => ({
   troubleshootingApi: {
     evidenceCatalog: () => evidenceCatalog(),
     observabilityAssets: () => observabilityAssets(),
+    evidenceContracts: () => evidenceContracts(),
   },
 }))
 
@@ -51,17 +54,17 @@ describe('evidence setup gate', () => {
   it('puts the data source before the module when neither exists', async () => {
     const { text, unmount } = await render()
 
-    expect(text()).toContain('先接通一个真实数据源')
+    expect(text()).toContain('先检查数据连接')
     // 登记模块是离线能做的准备，所以留着——但不占主位。
-    expect(text()).toContain('仍然先登记模块')
+    expect(text()).toContain('仍然先新增系统')
     unmount()
   })
 
   it('leads with the module once a source is actually ready', async () => {
     const { text, unmount } = await render({ sourceReady: true })
 
-    expect(text()).toContain('接入第一个系统模块')
-    expect(text()).not.toContain('先接通一个真实数据源')
+    expect(text()).toContain('接入第一个系统')
+    expect(text()).not.toContain('先检查数据连接')
     expect(text()).not.toContain('还不能取到真实证据')
     unmount()
   })
@@ -100,11 +103,15 @@ describe('evidence setup gate', () => {
       data: catalog(options.sourceReady ?? false, options.replayReady ?? false),
     })
     observabilityAssets.mockResolvedValue({ data: assets() })
+    evidenceContracts.mockResolvedValue({ data: { workspaceId: '1', contracts: [] } })
 
     const Page = (await import('../ObservabilityAssetsWorkspace.vue')).default
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp(Page)
+    // 这一页要不要显示管理员设置卡由 manage:troubleshooting 决定。
+    // 测试不加载能力集，判定为 false，设置卡不渲染，断言只看列表本身。
+    app.use(createPinia())
     app.mount(host)
     await nextTick()
     await Promise.resolve()

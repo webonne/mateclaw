@@ -9,6 +9,8 @@ import vip.mate.troubleshooting.engine.CriterionEvaluator;
 import vip.mate.troubleshooting.engine.DiagnosisRuleEvaluator;
 import vip.mate.troubleshooting.evidence.EvidenceSourceRouter;
 import vip.mate.troubleshooting.evidence.EvidenceSpineOrchestrator;
+import vip.mate.troubleshooting.evidence.ScenarioEvidenceRunAudit;
+import vip.mate.troubleshooting.evidence.ScenarioEvidenceRunAuditService;
 import vip.mate.troubleshooting.evidence.PlaybookEvidenceCollector;
 import vip.mate.troubleshooting.model.AnomalyCriterion;
 import vip.mate.troubleshooting.model.ConclusionType;
@@ -30,7 +32,9 @@ import vip.mate.troubleshooting.synthesis.ApprovedPlaybookVersion;
 import vip.mate.troubleshooting.synthesis.DeterministicLogTraceCompressor;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
@@ -57,19 +61,24 @@ class ScenarioEvidenceRunServiceTest {
     private static final Instant NOW = Instant.parse("2026-07-30T12:00:00Z");
     private static final String SELECTOR = "csdp:scenario:message_send_failed";
     private static final String SCENARIO_KEY = "message_send_failed";
+    private static final String CTI_SCENARIO_KEY = "cti_create_conversation_failed";
+    private static final Instant CTI_OCCURRED_AT = Instant.parse("2026-08-07T09:24:00Z");
 
     private final TroubleshootingPersistenceService persistence =
             mock(TroubleshootingPersistenceService.class);
     private final TroubleshootingPlaybookVersionService versions =
             mock(TroubleshootingPlaybookVersionService.class);
     private final EvidenceSourceRouter router = mock(EvidenceSourceRouter.class);
+    private final ScenarioEvidenceRunAuditService runAudits =
+            mock(ScenarioEvidenceRunAuditService.class);
     private final DiagnosisStateMachine stateMachine = new DiagnosisStateMachine(
             Clock.fixed(NOW, ZoneOffset.UTC), prefix -> prefix + "-fixed");
     private final CriterionEvaluator criteria = new CriterionEvaluator();
     private final DiagnosisRuleEvaluator rules = new DiagnosisRuleEvaluator();
     private final ScenarioEvidenceRunService service = new ScenarioEvidenceRunService(
             persistence, versions, stateMachine, criteria, rules,
-            new PlaybookEvidenceCollector(router));
+            new PlaybookEvidenceCollector(router), runAudits,
+            Clock.fixed(NOW, ZoneOffset.UTC));
 
     @Test
     @DisplayName("跑完取证计划后诊断不再停在待取证，结论来自 Playbook 自己的规则")
@@ -95,6 +104,32 @@ class ScenarioEvidenceRunServiceTest {
     }
 
     @Test
+    @DisplayName("只读取证生成不可变运行耗时，不改写首次弃权结论时间")
+    void evidenceRunPersistsItsOwnTimingWithoutRewritingTheFirstConclusion() {
+        awaiting();
+        when(router.collect(eq(7L), any(EvidenceRequest.class), any(IncidentContext.class)))
+                .thenReturn(evidence(EvidenceStatus.ANOMALY, Map.of("match_count", 3)));
+        when(persistence.update(eq(7L), any(Diagnosis.class), eq(4)))
+                .thenAnswer(call -> new StoredDiagnosis(call.getArgument(1), 5, false));
+        ScenarioEvidenceRunService timedService = new ScenarioEvidenceRunService(
+                persistence, versions, stateMachine, criteria, rules,
+                new PlaybookEvidenceCollector(router), runAudits,
+                new SequenceClock(NOW.minusSeconds(5), NOW));
+
+        Diagnosis advanced = timedService.run(7L, "diag-scenario", "alice").diagnosis();
+
+        assertThat(advanced.timings().conclusionAt()).isEqualTo(NOW.minusSeconds(110));
+        assertThat(advanced.timings().investigateCost()).isZero();
+        ArgumentCaptor<ScenarioEvidenceRunAudit> audit =
+                ArgumentCaptor.forClass(ScenarioEvidenceRunAudit.class);
+        verify(runAudits).insert(eq(7L), audit.capture());
+        assertThat(audit.getValue().startedAt()).isEqualTo(NOW.minusSeconds(5));
+        assertThat(audit.getValue().completedAt()).isEqualTo(NOW);
+        assertThat(audit.getValue().duration()).isEqualTo(Duration.ofSeconds(5));
+        assertThat(audit.getValue().evidenceRefs()).containsExactly("SYNTH-LOG-SEARCH");
+    }
+
+    @Test
     @DisplayName("三段证据方案把第一步真实 PS ID 传给后两步并写回同一 Diagnosis")
     void evidenceSpineUsesTheObservedPsIdAndPersistsRealEvidence() {
         SopEntry spinePlaybook = spinePlaybook();
@@ -113,7 +148,8 @@ class ScenarioEvidenceRunServiceTest {
                 persistence, versions, stateMachine, criteria, rules,
                 new PlaybookEvidenceCollector(router),
                 new EvidenceSpineOrchestrator(
-                        router, new DeterministicLogTraceCompressor()));
+                        router, new DeterministicLogTraceCompressor()),
+                runAudits, Clock.fixed(NOW, ZoneOffset.UTC));
 
         Diagnosis advanced = spineService.run(7L, "diag-spine", "alice").diagnosis();
 
@@ -141,6 +177,122 @@ class ScenarioEvidenceRunServiceTest {
                 .containsExactlyEntriesOf(Map.of(
                         "scenario_key", "message_send_failed",
                         "exclude_ps_id", "real-ps-20260804"));
+    }
+
+    @Test
+    @DisplayName("CTI 场景用告警时间跑完三段取证，结论不越过外层 701018")
+    void ctiScenarioRunsTheFrozenThreeStagePlanWithoutOverclaimingTheCause() {
+        SopEntry cti = ctiPlaybook();
+        Diagnosis waiting = stateMachine.initializeScenarioAwaitingEvidence(
+                new ScenarioDiagnosisDraft(
+                        "diag-cti", "case-cti", "run-cti", ctiIncident(),
+                        CTI_SCENARIO_KEY, cti,
+                        new PlaybookVersionRef("playbook-scenario", 1),
+                        "operator",
+                        NorthStarTimings.concluded(
+                                CTI_OCCURRED_AT, CTI_OCCURRED_AT, CTI_OCCURRED_AT),
+                        false, true, List.of("取证尚未执行")));
+        when(persistence.get(7L, "diag-cti"))
+                .thenReturn(new StoredDiagnosis(waiting, 4, false));
+        when(versions.findByRef(eq(7L), any(PlaybookVersionRef.class)))
+                .thenReturn(Optional.of(approved(cti)));
+        when(router.collect(
+                eq(7L), any(EvidenceRequest.class), any(IncidentContext.class),
+                eq((Set<String>) null)))
+                .thenAnswer(call -> ctiEvidence(call.getArgument(1)));
+        when(persistence.update(eq(7L), any(Diagnosis.class), eq(4)))
+                .thenAnswer(call -> new StoredDiagnosis(call.getArgument(1), 5, false));
+        ScenarioEvidenceRunService spineService = new ScenarioEvidenceRunService(
+                persistence, versions, stateMachine, criteria, rules,
+                new PlaybookEvidenceCollector(router),
+                new EvidenceSpineOrchestrator(
+                        router, new DeterministicLogTraceCompressor()),
+                runAudits, Clock.fixed(NOW, ZoneOffset.UTC));
+
+        Diagnosis advanced = spineService.run(7L, "diag-cti", "alice").diagnosis();
+
+        assertThat(advanced.status()).isEqualTo(DiagnosisStatus.READY_FOR_HUMAN);
+        assertThat(advanced.conclusionType()).isEqualTo(ConclusionType.HYPOTHESIS);
+        assertThat(advanced.rootCause()).isEqualTo("CTI 会话创建失败（外层 701018）");
+        assertThat(advanced.summary())
+                .contains("不声称已证明 701022")
+                .doesNotContain("下游组件根因已确认");
+        assertThat(advanced.evidence())
+                .extracting(EvidenceResult::source)
+                .containsExactly(
+                        "guance:log_search",
+                        "guance:log_trace_bundle",
+                        "guance:contrast_sample");
+        assertThat(advanced.evidence().get(1).observed().toString())
+                .contains("error_codes=701018", "error_codes=701022")
+                .doesNotContain("CreateConversation failed", "code 701018", "code 701022");
+
+        ArgumentCaptor<EvidenceRequest> requests =
+                ArgumentCaptor.forClass(EvidenceRequest.class);
+        ArgumentCaptor<IncidentContext> incidents =
+                ArgumentCaptor.forClass(IncidentContext.class);
+        verify(router, times(3)).collect(
+                eq(7L), requests.capture(), incidents.capture(),
+                eq((Set<String>) null));
+        assertThat(requests.getAllValues().get(0).target())
+                .containsExactlyEntriesOf(Map.of("search_term", CTI_SCENARIO_KEY));
+        assertThat(requests.getAllValues().get(1).target())
+                .containsExactlyEntriesOf(Map.of("ps_id", "cti-trace-real"));
+        assertThat(requests.getAllValues().get(2).target())
+                .containsExactlyEntriesOf(Map.of(
+                        "scenario_key", CTI_SCENARIO_KEY,
+                        "exclude_ps_id", "cti-trace-real"));
+        assertThat(incidents.getAllValues())
+                .allMatch(incident -> CTI_OCCURRED_AT.equals(incident.occurredAt()));
+    }
+
+    @Test
+    @DisplayName("CTI 对照暂不可用时降级但不抹掉外层 701018 假设")
+    void ctiScenarioKeepsTheLowHypothesisWhenOnlyOptionalContrastIsMissing() {
+        SopEntry cti = ctiPlaybook();
+        Diagnosis waiting = stateMachine.initializeScenarioAwaitingEvidence(
+                new ScenarioDiagnosisDraft(
+                        "diag-cti", "case-cti", "run-cti", ctiIncident(),
+                        CTI_SCENARIO_KEY, cti,
+                        new PlaybookVersionRef("playbook-scenario", 1),
+                        "operator",
+                        NorthStarTimings.concluded(
+                                CTI_OCCURRED_AT, CTI_OCCURRED_AT, CTI_OCCURRED_AT),
+                        false, true, List.of("取证尚未执行")));
+        when(persistence.get(7L, "diag-cti"))
+                .thenReturn(new StoredDiagnosis(waiting, 4, false));
+        when(versions.findByRef(eq(7L), any(PlaybookVersionRef.class)))
+                .thenReturn(Optional.of(approved(cti)));
+        when(router.collect(
+                eq(7L), any(EvidenceRequest.class), any(IncidentContext.class),
+                eq((Set<String>) null)))
+                .thenAnswer(call -> {
+                    EvidenceRequest request = call.getArgument(1);
+                    return "contrast_sample".equals(request.signalKind())
+                            ? new EvidenceResult(
+                                    request.requestId(), "L", "withheld",
+                                    EvidenceStatus.MISSING,
+                                    "optional comparison unavailable", Map.of(),
+                                    "guance:contrast_sample", CTI_OCCURRED_AT)
+                            : ctiEvidence(request);
+                });
+        when(persistence.update(eq(7L), any(Diagnosis.class), eq(4)))
+                .thenAnswer(call -> new StoredDiagnosis(call.getArgument(1), 5, false));
+        ScenarioEvidenceRunService spineService = new ScenarioEvidenceRunService(
+                persistence, versions, stateMachine, criteria, rules,
+                new PlaybookEvidenceCollector(router),
+                new EvidenceSpineOrchestrator(
+                        router, new DeterministicLogTraceCompressor()),
+                runAudits, Clock.fixed(NOW, ZoneOffset.UTC));
+
+        Diagnosis advanced = spineService.run(7L, "diag-cti", "alice").diagnosis();
+
+        assertThat(advanced.status()).isEqualTo(DiagnosisStatus.READY_FOR_HUMAN);
+        assertThat(advanced.conclusionType()).isEqualTo(ConclusionType.HYPOTHESIS);
+        assertThat(advanced.confidence()).isEqualTo(Confidence.LOW);
+        assertThat(advanced.rootCause()).isEqualTo("CTI 会话创建失败（外层 701018）");
+        assertThat(advanced.warnings())
+                .anyMatch(warning -> warning.contains("CTI-CONTRAST"));
     }
 
     @Test
@@ -318,6 +470,40 @@ class ScenarioEvidenceRunServiceTest {
                         "-15m", true)));
     }
 
+    private static SopEntry ctiPlaybook() {
+        return new SopEntry(
+                "playbook-scenario",
+                SopEntry.CURRENT_CONTRACT_VERSION,
+                "CSDP", "scenario:" + CTI_SCENARIO_KEY, "csdp-task",
+                "CTI 创建会话失败路径核查",
+                "CTI 会话创建失败（外层错误码 701018），下游具体根因待人工核对",
+                "cti", "CSDP TASK 负责团队", "approved", true,
+                List.of(
+                        new EvidenceRequest(
+                                "CTI-LOG-SEARCH", "log_search", "查找外层 701018",
+                                Map.of("search_term", CTI_SCENARIO_KEY), "-15m", true),
+                        new EvidenceRequest(
+                                "CTI-TRACE-BUNDLE", "log_trace_bundle", "沿关联 ID 还原链路",
+                                Map.of("ps_id", "must-not-be-used"), "-15m", true),
+                        new EvidenceRequest(
+                                "CTI-CONTRAST", "contrast_sample", "对比成功与失败样本",
+                                Map.of(
+                                        "scenario_key", CTI_SCENARIO_KEY,
+                                        "exclude_ps_id", "must-not-be-used"),
+                                "-15m", false)),
+                List.of(new AnomalyCriterion(
+                        "cti_create_conversation_failure_present",
+                        "CTI-LOG-SEARCH", "观测到外层 701018",
+                        new Criterion.NumericGte("match_count", 1))),
+                List.of(new DiagnosisRule(
+                        "RULE-CTI-CREATE-CONVERSATION-FAILURE",
+                        List.of("cti_create_conversation_failure_present"),
+                        "CTI 会话创建失败（外层 701018）",
+                        "故障窗口内已观测到外层 701018；当前判据不声称已证明 701022 或下游具体组件根因。",
+                        Confidence.LOW, ConclusionType.HYPOTHESIS, false)),
+                List.of());
+    }
+
     private static SopEntry assetBackedPlaybook() {
         return playbook(new EvidenceRequest(
                 "SYNTH-LOG-SEARCH", "synthetic_probe", "执行资产工具取证",
@@ -373,6 +559,40 @@ class ScenarioEvidenceRunServiceTest {
                 "guance:" + request.signalKind(), NOW);
     }
 
+    private static EvidenceResult ctiEvidence(EvidenceRequest request) {
+        Map<String, Object> observed = switch (request.signalKind()) {
+            case "log_search" -> Map.of(
+                    "match_count", 1,
+                    "ps_id", "cti-trace-real",
+                    "sample_message", "cti_create_conversation_failed");
+            case "log_trace_bundle" -> Map.of(
+                    "ps_id", "cti-trace-real",
+                    "entries", List.of(
+                            traceEntry(1_000, "csdp-task", "ERROR", "CreateConversation failed"),
+                            traceEntry(1_010, "csdp-task", "ERROR", "code 701022"),
+                            traceEntry(1_020, "csdp-task", "ERROR", "code 701018")));
+            case "contrast_sample" -> Map.of(
+                    "discriminating_feature", "inner_701022_on_failed_trace",
+                    "failure_sample_count", 1,
+                    "failure_match_count", 1,
+                    "success_sample_count", 4,
+                    "success_match_count", 0);
+            default -> throw new IllegalArgumentException(request.signalKind());
+        };
+        return new EvidenceResult(
+                request.requestId(), "L", "withheld", EvidenceStatus.ANOMALY,
+                "canonical Guance evidence", observed,
+                "guance:" + request.signalKind(), CTI_OCCURRED_AT);
+    }
+
+    private static IncidentContext ctiIncident() {
+        return new IncidentContext(
+                "inc-cti", "CSDP", "csdp-task", null,
+                "CTI创建会话失败", "P1", "待确认", null,
+                CTI_OCCURRED_AT, null, "web:scenario",
+                IncidentCompleteness.SYMPTOM, "集群 sz4-s-zaibei，告警数量 3");
+    }
+
     private static Map<String, Object> traceEntry(
             long timestamp, String service, String level, String message) {
         return Map.of(
@@ -389,5 +609,31 @@ class ScenarioEvidenceRunServiceTest {
                 "reviewer", "内网核实通过", null,
                 null, null, null,
                 playbook, NOW.minusSeconds(600), NOW.minusSeconds(600));
+    }
+
+    private static final class SequenceClock extends Clock {
+        private final Instant[] ticks;
+        private int index;
+
+        private SequenceClock(Instant... ticks) {
+            this.ticks = ticks.clone();
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            Instant value = ticks[Math.min(index, ticks.length - 1)];
+            index++;
+            return value;
+        }
     }
 }

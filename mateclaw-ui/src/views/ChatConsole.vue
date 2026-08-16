@@ -69,6 +69,12 @@
           <div v-else class="no-agent-hint">{{ $t('chat.selectAgent') }}</div>
         </div>
         <div class="chat-header-right">
+          <button
+            v-if="canOperateTroubleshooting"
+            type="button"
+            class="header-ts-launch"
+            @click="openConversationIntake"
+          >发起排障</button>
           <!-- Model selector — Issue #81 v2 R3: always pass full providers + show-all-states
                so unhealthy rows render as dimmed entries with status chips and a Fix
                button instead of disappearing entirely. -->
@@ -78,6 +84,8 @@
             :active-label="activeModelLabel"
             :saving="modelSaving"
             :show-all-states="true"
+            :can-configure="canConfigureModels"
+            :empty-hint="modelSelectorEmptyHint"
             @select="selectModel"
             @navigate-fix="onModelSelectorFix"
           />
@@ -102,6 +110,15 @@
         </div>
       </div>
 
+      <TeamWorkerBanner
+        v-if="workerRunContext"
+        :run-id="workerRunContext.runId"
+        :task-id="workerRunContext.taskId"
+        :team-id="workerRunContext.teamId"
+        :lead-conversation-id="workerRunContext.leadConversationId"
+        @navigate="router.push($event)"
+      />
+
       <!-- 使用组件化的 MessageList -->
       <MessageList
         ref="messageListRef"
@@ -112,6 +129,12 @@
         :title="blockingPrompt ? modelPromptText.title : $t('app.title')"
         :subtitle="blockingPrompt ? modelPromptText.desc : $t('chat.subtitle')"
         :suggestions="blockingPrompt ? [] : suggestions"
+        :team-runs="teamRuns"
+        :expanded-team-run-id="teamRunRouteQuery.teamRunId || null"
+        :selected-team-task-id="teamRunRouteQuery.taskId || null"
+        :team-runs-has-more="Boolean(teamRunsNextCursor)"
+        :team-runs-loading-more="teamRunsLoadingMore"
+        :readonly="workerConversationReadOnly"
         @regenerate="handleRegenerate"
         @rewind="handleRewind"
         @suggestion-click="sendSuggestion"
@@ -119,6 +142,8 @@
         @approve="handleApprove"
         @approve-always="handleApproveAlways"
         @deny="handleDeny"
+        @team-run-navigate="router.push($event)"
+        @team-runs-load-more="loadMoreTeamRuns"
       >
         <!-- Issue #81 v2 R2: blocking-only popup. Recoverable cases use the
              non-blocking <RecoverableModelBanner> below instead. -->
@@ -150,6 +175,17 @@
         :fallback-name="bestFallbackName"
         @dismiss="recoverableDismissed = true"
       />
+
+      <div v-if="tsIntentOffer" class="ts-intent-banner" role="status">
+        <div class="ts-intent-copy">
+          <b>这句更像排障告警</b>
+          <span>可以走排障补问并生成排障单；也可以继续普通对话，不打断助手。</span>
+        </div>
+        <div class="ts-intent-actions">
+          <button type="button" class="btn-primary" @click="acceptTroubleshootingIntent">用排障流程</button>
+          <button type="button" class="btn-secondary" @click="declineTroubleshootingIntent">继续普通对话</button>
+        </div>
+      </div>
 
       <!-- Cron job in-flight placeholder — visible while T2 hasn't committed
            the assistant message yet. Populated by pollActivity → /cron-jobs/active-runs. -->
@@ -221,8 +257,8 @@
       <ChatInput
         ref="chatInputRef"
         v-model="inputText"
-        :loading="isGenerating && !hasPendingApproval"
-        :disabled="blockingPrompt || !currentAgent"
+        :loading="(isGenerating && !hasPendingApproval) || tsIntakeLoading"
+        :disabled="blockingPrompt || !currentAgent || workerConversationReadOnly || tsIntakeLoading"
         :skills-enabled="!!currentAgent && !currentAgent.skillsDisabled"
         :placeholder="$t('chat.messagePlaceholder')"
         :hint="currentRuntimeModel"
@@ -264,6 +300,12 @@
           :conversation-id="currentConversationId"
           @close="showTalkMode = false"
         />
+
+        <ConversationIntakeDialog
+          v-model="conversationIntakeOpen"
+          @switch-form="goTroubleshootingForm"
+          @ready="onConversationIntakeReady"
+        />
       </div>
     </div>
   </div>
@@ -286,13 +328,24 @@ import { copyToClipboard } from '@/utils/clipboard'
 import { useFileDrop } from '@/composables/useFileDrop'
 import { useIsMobile, useMediaQuery, BREAKPOINTS } from '@/composables/useBreakpoint'
 import { useChat } from '@/composables/chat/useChat'
+import { useTeamRuns } from '@/composables/chat/useTeamRuns'
+import { useWorkerConversationGuard } from '@/composables/chat/useWorkerConversationGuard'
+import { parseTeamMessageMetadata } from '@/composables/chat/messageMetadata'
 import RunOverviewPanel from '@/components/chat/RunOverviewPanel.vue'
 import { reconstructErrorInfo } from '@/types/chatError'
 import { reconcileMessages, extractMessages } from '@/utils/messageReconcile'
-import type { Conversation, Agent, ModelConfig, ProviderInfo, ActiveModelsInfo, ChatAttachment, MessageContentPart, Message, ToolCallMeta, StreamPhase } from '@/types'
+import {
+  buildChatRouteQuery,
+  readLegacyWorkerRouteContext,
+  readTeamRunRouteQuery,
+  resolveConversationAgentSelection,
+  resolveRouteHydrationQuery,
+} from '@/utils/chatRouteHydration'
+import type { Conversation, Agent, ModelConfig, ProviderInfo, ActiveModelsInfo, ChatAttachment, MessageContentPart, Message, ToolCallMeta } from '@/types'
 
 // 导入组件化组件
 import MessageList from '@/components/chat/MessageList.vue'
+import TeamWorkerBanner from '@/components/chat/TeamWorkerBanner.vue'
 import RecoverableModelBanner from '@/components/chat/RecoverableModelBanner.vue'
 import SkillIcon from '@/components/common/SkillIcon.vue'
 import ConversationSidebar from '@/components/chat/ConversationSidebar.vue'
@@ -309,11 +362,30 @@ import { useKatexRenderer } from '@/composables/useKatexRenderer'
 import { useMermaidRenderer, handleMermaidDownload } from '@/composables/useMermaidRenderer'
 import { useGoalStore } from '@/stores/useGoalStore'
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore'
+import { buildViewerModelProviders } from '@/utils/viewerModelProviders'
 import GoalSetInlinePrompt from '@/components/goal/GoalSetInlinePrompt.vue'
 import GoalSystemLine from '@/components/goal/GoalSystemLine.vue'
+import ConversationIntakeDialog from '@/views/Troubleshooting/ConversationIntakeDialog.vue'
+import {
+  shouldAutoStartTroubleshootingIntake,
+  shouldOfferTroubleshootingIntake,
+  troubleshootingDiagnosisResultMessage,
+} from '@/views/Troubleshooting/chatTroubleshootingIntent'
+import { troubleshootingApi } from '@/api'
+
+const TS_LAUNCH_SUGGESTION = '发起排障（粘贴告警）'
 
 // ============ Talk Mode ============
 const showTalkMode = ref(false)
+const conversationIntakeOpen = ref(false)
+/** Soft confirm when chat text looks like an alert but is not HIGH confidence. */
+const tsIntentOffer = ref<{ text: string } | null>(null)
+/** After user confirms, subsequent turns stay on Intake until READY / exit. */
+const tsIntakeActive = ref(false)
+const tsIntakeConversationId = ref<string | null>(null)
+const tsIntakeLoading = ref(false)
+/** User chose "continue normal chat" for this browser chat conversation. */
+const tsIntentSuppressedConvIds = ref<Set<string>>(new Set())
 
 // ============ 移动端 & 响应式状态 ============
 const convPanelOpen = ref(false)
@@ -343,27 +415,31 @@ function toggleConvPanel() {
 // ============ 配置和常量 ============
 const suggestions = computed(() => {
   const agent = currentAgent.value
+  let base: string[] = []
   // If agent has custom suggestions (stored as newline-separated string in description etc.)
   const agentSuggestions = (agent as any)?.suggestions as string | undefined
   if (agentSuggestions) {
     const parsed = agentSuggestions.split('\n').filter(Boolean).slice(0, 4)
-    if (parsed.length) return parsed
-  }
-  // Agent-type-aware defaults
-  if (agent?.agentType === 'plan_execute') {
-    return [
+    if (parsed.length) base = parsed
+  } else if (agent?.agentType === 'plan_execute') {
+    base = [
       t('chat.suggestionPlan1', '帮我制定一个完整的项目计划'),
       t('chat.suggestionPlan2', '分步骤帮我完成一个复杂任务'),
       t('chat.suggestionIntro'),
       t('chat.suggestionWeather'),
     ]
+  } else {
+    base = [
+      t('chat.suggestionIntro'),
+      t('chat.suggestionPoem'),
+      t('chat.suggestionCode'),
+      t('chat.suggestionWeather'),
+    ]
   }
-  return [
-    t('chat.suggestionIntro'),
-    t('chat.suggestionPoem'),
-    t('chat.suggestionCode'),
-    t('chat.suggestionWeather'),
-  ]
+  if (canOperateTroubleshooting.value) {
+    return [TS_LAUNCH_SUGGESTION, ...base.slice(0, 3)]
+  }
+  return base
 })
 
 // ============ 状态 ============
@@ -392,14 +468,12 @@ const recoverablePrompt = ref(false)
 const recoverableDismissed = ref(false)
 const defaultModel = ref<ModelConfig | null>(null)
 const providers = ref<ProviderInfo[]>([])
-// True when /models 403s for a viewer-level user. Provider config (API keys,
-// base URLs, liveness) is admin-only, so viewers chat without it; the prompt
-// flags fall back to "trust the active model" in that branch.
+// True when a viewer uses the credential-free provider projection. Provider
+// config (API keys, base URLs, liveness) is admin-only, so viewers can switch
+// models but prompt flags must still trust the active model's runtime state.
 const providersUnavailable = ref(false)
-// Mirror of /models/enabled (viewer-accessible). Used to resolve the display
-// name of the active model when providers is empty for viewer-level users —
-// otherwise the model selector trigger would show its 配置模型 fallback even
-// though there IS an active model.
+// Mirror of /models/enabled (viewer-accessible). It supplies the model half of
+// the safe picker projection and resolves the active label during hydration.
 const enabledModels = ref<ModelConfig[]>([])
 // The model the CURRENT conversation uses. Per-conversation — switching it
 // never leaks into other conversations (see selectModel / applyConversationModel).
@@ -628,6 +702,7 @@ function reconcileCurrentConversation() {
 const { isDragging, onDragEnter, onDragLeave, onDrop } = useFileDrop(processDroppedItems)
 
 async function processDroppedItems(e: DragEvent) {
+  if (workerConversationReadOnly.value) return
   const dtFiles = Array.from(e.dataTransfer?.files || [])
   const items = Array.from(e.dataTransfer?.items || [])
 
@@ -669,6 +744,7 @@ async function processDroppedItems(e: DragEvent) {
 }
 
 function handleDirectoryAttach(dirFiles: File[]) {
+  if (workerConversationReadOnly.value) return
   if (!currentConversationId.value) {
     newConversation()
   }
@@ -781,6 +857,44 @@ const {
   },
 })
 
+const teamRunRouteQuery = computed(() => readTeamRunRouteQuery(route.query))
+const metadataWorkerRunId = computed(() => {
+  for (let index = messages.value.length - 1; index >= 0; index -= 1) {
+    const metadata = parseTeamMessageMetadata(messages.value[index])
+    if (metadata.runId && metadata.taskId) return metadata.runId
+  }
+  return undefined
+})
+const linkedTeamRunId = computed(() => teamRunRouteQuery.value.teamRunId ?? metadataWorkerRunId.value)
+const {
+  runs: teamRuns,
+  nextCursor: teamRunsNextCursor,
+  loadingMore: teamRunsLoadingMore,
+  loadMore: loadMoreTeamRuns,
+} = useTeamRuns(currentConversationId, { linkedRunId: linkedTeamRunId })
+const currentConversationKind = computed(() => conversations.value
+  .find(conversation => conversation.conversationId === currentConversationId.value)?.conversationKind)
+const workerRouteHint = computed(() => Boolean(
+  teamRunRouteQuery.value.teamRunId
+  || teamRunRouteQuery.value.taskId
+  || currentConversationKind.value === 'team_worker'))
+const workerGuard = useWorkerConversationGuard({
+  conversationId: currentConversationId,
+  workerHint: workerRouteHint,
+  load: async (conversationId) => {
+    if (isEphemeralConversation(conversationId)) return null
+    const query = teamRunRouteQuery.value
+    const response = await conversationApi.getTeamWorkerContext(conversationId, {
+      runId: query.teamRunId,
+      taskId: query.taskId,
+    })
+    return response.data ?? null
+  },
+})
+const workerRunContext = computed(() => workerGuard.context.value
+  ?? readLegacyWorkerRouteContext(currentConversationId.value, route.query))
+const workerConversationReadOnly = computed(() => workerGuard.readOnly.value)
+
 // ============ 连接状态 ============
 const connectionStatusClass = computed(() => {
   if (isGenerating.value) return 'status-streaming'
@@ -831,7 +945,7 @@ const currentRuntimeModel = computed(() => {
     const all = provider ? [...(provider.models || []), ...(provider.extraModels || [])] : []
     const hit = all.find((m) => m.id === modelName || m.name === modelName)
     if (hit) return `${hit.name || hit.id} (${hit.id})`
-    // Viewer-level users get an empty providers list — resolve via /models/enabled.
+    // During initial hydration the safe provider projection may not be ready yet.
     const em = enabledModels.value.find(
       (m) => m.provider === providerId && (m.modelName === modelName || m.name === modelName)
     )
@@ -879,10 +993,9 @@ const activeModelLabel = computed(() => {
   if (!activeModelValue.value) return ''
   const match = eligibleModels.value.find(m => m.value === activeModelValue.value)
   if (match?.label) return match.label
-  // Viewer-level users have an empty providers list (admin-only endpoint), so
-  // eligibleModels is empty even when there IS an active model. Fall back to
-  // the viewer-readable /models/enabled list to resolve a display name —
-  // otherwise the trigger button would read "配置模型" forever.
+  // Fall back to the viewer-readable /models/enabled list while the safe
+  // provider projection is still hydrating, so the trigger never flashes the
+  // "配置模型" placeholder for an already active model.
   const providerId = activeModels.value?.activeLlm?.providerId
   const modelName = activeModels.value?.activeLlm?.model
   if (!providerId || !modelName) return ''
@@ -1175,6 +1288,9 @@ async function pollActivity() {
           // 2. 再接入流，让后续 content_delta 实时累积到 assistant 气泡。
           await refreshCurrentConversationMessages(cid)
           if (currentConversationId.value !== cid || isGenerating.value) return
+          // Match selectConversation's behavior: a stale scroll-escape from an
+          // earlier upward scroll must not suppress follow-scroll on reconnect.
+          messageListRef.value?.resetScrollLock()
           await reconnectStream(cid)
         } else if (!hasLocalOnlyFailedTail()) {
           // 不在跑：从 DB 对齐消息（新 user 消息 / 刚落库 assistant 会合并进来）。
@@ -1295,8 +1411,159 @@ watch([selectedAgentId, currentConversationId], () => {
 // avatar ring listens on goalStore.activeGoalByConv[cid]; without this
 // fetch the ring would only appear after an SSE event mutated the store.
 const goalStore = useGoalStore()
-const workspaceStoreForGoal = useWorkspaceStore()
-const currentWorkspaceId = computed(() => workspaceStoreForGoal.currentWorkspaceId ?? '1')
+const workspaceStore = useWorkspaceStore()
+const currentWorkspaceId = computed(() => workspaceStore.currentWorkspaceId ?? '1')
+const canOperateTroubleshooting = computed(() =>
+  workspaceStore.can('operate:troubleshooting'),
+)
+const canConfigureModels = computed(() => workspaceStore.isGlobalAdmin)
+const modelSelectorEmptyHint = computed(() => canConfigureModels.value
+  ? undefined
+  : t('chat.noModelsAvailableContactAdmin'))
+
+function openConversationIntake() {
+  if (!canOperateTroubleshooting.value) {
+    ElMessage.warning('当前 Workspace 缺少 operate:troubleshooting 权限')
+    return
+  }
+  if (currentConversationId.value) {
+    tsIntentSuppressedConvIds.value.delete(currentConversationId.value)
+  }
+  conversationIntakeOpen.value = true
+}
+
+function goTroubleshootingForm() {
+  conversationIntakeOpen.value = false
+  router.push({ path: '/troubleshooting', query: { view: 'list' } })
+}
+
+async function onConversationIntakeReady(payload: {
+  diagnosisId: string
+  created: boolean | null
+  rehearsal: boolean
+}) {
+  exitTroubleshootingIntakeMode()
+  if (payload.created === false) {
+    ElMessage.info(`已汇合既有排障单 ${payload.diagnosisId}；分析结果已显示在排障对话`)
+  } else {
+    ElMessage.success(
+      `${payload.rehearsal ? '演练' : '正式'}排障单 ${payload.diagnosisId} 已生成；分析结果已显示在排障对话`,
+    )
+  }
+}
+
+function exitTroubleshootingIntakeMode() {
+  tsIntakeActive.value = false
+  tsIntakeConversationId.value = null
+  tsIntakeLoading.value = false
+  tsIntentOffer.value = null
+}
+
+function isTsIntentSuppressed(): boolean {
+  const cid = currentConversationId.value
+  return Boolean(cid && tsIntentSuppressedConvIds.value.has(cid))
+}
+
+function appendLocalChatMessage(
+  role: 'user' | 'assistant',
+  content: string,
+  opts?: { asEmployee?: boolean },
+) {
+  if (!currentConversationId.value) {
+    currentConversationId.value = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  }
+  let text = content
+  if (role === 'assistant' && opts?.asEmployee && currentAgent.value) {
+    const name = currentAgent.value.name || '数字员工'
+    text = `【${name} · 排障】\n${content}`
+  }
+  messages.value.push({
+    id: `ts-local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    conversationId: currentConversationId.value,
+    role,
+    content: text,
+    contentParts: [{ type: 'text', text }],
+    status: 'completed',
+    createTime: new Date().toISOString(),
+    metadata: opts?.asEmployee && selectedAgentId.value
+      ? {
+          troubleshooting: true,
+          agentId: String(selectedAgentId.value),
+          agentName: currentAgent.value?.name,
+        } as any
+      : undefined,
+  })
+}
+
+async function runTroubleshootingIntakeTurn(text: string) {
+  const trimmed = text.trim()
+  if (!trimmed || tsIntakeLoading.value) return
+  tsIntakeLoading.value = true
+  tsIntentOffer.value = null
+  appendLocalChatMessage('user', trimmed)
+  inputText.value = ''
+  chatInputRef.value?.clear?.()
+  try {
+    const { data } = await troubleshootingApi.conversationTurn({
+      conversationId: tsIntakeConversationId.value,
+      text: trimmed,
+      rehearsal: true,
+    })
+    tsIntakeActive.value = true
+    tsIntakeConversationId.value = data.conversationId
+    const resultAction = data.status === 'READY' && data.diagnosisId
+      ? troubleshootingDiagnosisResultMessage(
+          data.diagnosisId,
+          data.created,
+          data.rehearsal,
+        )
+      : ''
+    appendLocalChatMessage(
+      'assistant',
+      resultAction ? `${data.prompt}\n\n${resultAction}` : data.prompt,
+      { asEmployee: true },
+    )
+    if (data.status === 'READY' && data.diagnosisId) {
+      exitTroubleshootingIntakeMode()
+      const employee = currentAgent.value?.name
+      ElMessage.success(
+        data.created === false
+          ? `已汇合既有排障单；结论已由${employee ? `「${employee}」` : '当前员工'}回写本对话`
+          : `演练排障结论已由${employee ? `「${employee}」` : '当前员工'}回写本对话`,
+      )
+    }
+  } catch (error: any) {
+    appendLocalChatMessage(
+      'assistant',
+      error?.message || '排障补问失败，已保留在当前对话。你可以改点「继续普通对话」或重试。',
+      { asEmployee: true },
+    )
+  } finally {
+    tsIntakeLoading.value = false
+  }
+}
+
+async function acceptTroubleshootingIntent() {
+  const pending = tsIntentOffer.value?.text?.trim()
+  tsIntentOffer.value = null
+  if (!pending) {
+    openConversationIntake()
+    return
+  }
+  await runTroubleshootingIntakeTurn(pending)
+}
+
+async function declineTroubleshootingIntent() {
+  const pending = tsIntentOffer.value?.text?.trim()
+  tsIntentOffer.value = null
+  exitTroubleshootingIntakeMode()
+  if (currentConversationId.value) {
+    tsIntentSuppressedConvIds.value.add(currentConversationId.value)
+  }
+  if (pending) {
+    await continueNormalChatSend(pending)
+  }
+}
 watch(currentConversationId, async (cid) => {
   // Skip un-persisted conversations: a brand-new empty chat has no goal yet
   // and the lookup would only 403 (Not the owner). The ring is hydrated by the
@@ -1472,13 +1739,18 @@ async function loadAgents() {
 async function loadModelState() {
   // /default + /active + /enabled are viewer-accessible and required to chat.
   // /models (provider list) is admin-only because it returns API keys + base
-  // URLs; viewers degrade to "trust the active model, skip the liveness
-  // banner" and resolve the label via /enabled instead.
+  // URLs. Viewers join /models/options with /models/enabled for the selector,
+  // but still skip the liveness banner because neither safe response exposes
+  // runtime diagnostics.
   try {
-    const [defaultRes, activeRes, enabledRes]: any = await Promise.all([
+    const providerOptionsRequest = workspaceStore.isGlobalAdmin
+      ? Promise.resolve({ data: [] })
+      : modelApi.listProviderOptions()
+    const [defaultRes, activeRes, enabledRes, providerOptionsRes]: any = await Promise.all([
       modelApi.getDefault(),
       modelApi.getActive(),
       modelApi.listEnabled(),
+      providerOptionsRequest,
     ])
     defaultModel.value = defaultRes.data || null
     const ga = activeRes.data?.activeLlm
@@ -1492,6 +1764,17 @@ async function loadModelState() {
       activeModels.value = { activeLlm: { ...globalDefaultModel.value } }
     }
     enabledModels.value = enabledRes.data || []
+    if (!workspaceStore.isGlobalAdmin) {
+      providers.value = buildViewerModelProviders(
+        providerOptionsRes.data || [],
+        enabledModels.value,
+      )
+      // The safe projection intentionally has no liveness diagnostics. Trust
+      // the active model and let the runtime report a real call failure.
+      providersUnavailable.value = true
+      recomputePromptFlags()
+      return
+    }
   } catch (e) {
     mcToast.error(t('chat.loadModelFailed'))
     blockingPrompt.value = true
@@ -1594,24 +1877,12 @@ async function refreshCurrentConversationMessages(conversationId: string) {
 }
 
 async function hydrateStateFromRoute() {
-  let agentId = route.query.agentId ? String(route.query.agentId) : ''
-  let conversationId = String(route.query.conversationId || '')
-
-  // The URL can outlive its workspace: switching workspaces remounts this view
-  // (via the router-view key) but keeps the query string, so agentId /
-  // conversationId may still point at entities of the previous workspace. An
-  // agentId missing from the workspace-scoped agent list is such a leftover —
-  // drop it so the default-select below picks a real employee instead of the
-  // picker rendering the unresolvable raw id.
-  if (agentId && agents.value.length > 0 && !agents.value.some(a => String(a.id) === agentId)) {
-    agentId = ''
-    // Only follow the paired conversationId when it resolves locally (e.g. a
-    // Sessions-page jump within this workspace); otherwise it is equally stale
-    // and would attach the fallback agent to a foreign conversation.
-    if (!conversations.value.some(conv => conv.conversationId === conversationId)) {
-      conversationId = ''
-    }
-  }
+  const { agentId, conversationId } = resolveRouteHydrationQuery({
+    routeAgentId: route.query.agentId ? String(route.query.agentId) : '',
+    routeConversationId: String(route.query.conversationId || ''),
+    agents: agents.value,
+    conversations: conversations.value,
+  })
 
   if (agentId && agentId !== String(selectedAgentId.value)) {
     selectedAgentId.value = agentId
@@ -1620,7 +1891,7 @@ async function hydrateStateFromRoute() {
   if (conversationId && conversationId !== currentConversationId.value) {
     const matchedConversation = conversations.value.find(conv => conv.conversationId === conversationId)
     if (matchedConversation) {
-      await selectConversation(matchedConversation)
+      await selectConversation(matchedConversation, agentId)
     } else {
       // 会话不在已加载列表中（可能来自 Sessions 页面跳转），尝试加载消息
       currentConversationId.value = conversationId
@@ -1651,13 +1922,15 @@ async function hydrateStateFromRoute() {
 }
 
 function syncRouteState() {
-  const query: Record<string, string> = {}
-  if (selectedAgentId.value) query.agentId = String(selectedAgentId.value)
-  if (currentConversationId.value) query.conversationId = currentConversationId.value
+  const query = buildChatRouteQuery({
+    currentQuery: route.query,
+    agentId: selectedAgentId.value ? String(selectedAgentId.value) : undefined,
+    conversationId: currentConversationId.value || undefined,
+  })
   router.replace({ path: '/chat', query })
 }
 
-async function selectConversation(conv: Conversation) {
+async function selectConversation(conv: Conversation, routeAgentId = '') {
   if (isMobile.value) convPanelOpen.value = false
   // 切换到不同会话：只清理本地 UI/SSE（resetForNewConversation 会 stream.disconnect + 清变量），
   // 但不 POST /chat/{A}/stop —— 让 A 的后台 agent run 跑到完成。
@@ -1668,9 +1941,14 @@ async function selectConversation(conv: Conversation) {
   if (switchingAway) {
     resetForNewConversation()
     messageListRef.value?.resetScrollLock()
+    exitTroubleshootingIntakeMode()
   }
   currentConversationId.value = conv.conversationId
-  selectedAgentId.value = conv.agentId || selectedAgentId.value
+  selectedAgentId.value = resolveConversationAgentSelection({
+    routeAgentId,
+    conversationAgentId: conv.agentId,
+    currentAgentId: selectedAgentId.value,
+  })
   // Opening another conversation: its pin (or the agent/global fallback) is
   // authoritative, so clear the previous conversation's manual-pick guard.
   userPickedModel.value = false
@@ -1806,6 +2084,7 @@ function newConversation() {
   // Creating a new chat is just local navigation. Keep any previous backend
   // run alive so the user can return and reconnect to it later.
   resetForNewConversation()
+  exitTroubleshootingIntakeMode()
   currentConversationId.value = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
   messages.value = []
   // A fresh conversation defers to the selected agent's model (then the global
@@ -1903,7 +2182,10 @@ async function handleSendMessage(content: string) {
   // 允许在等待审批时发送审批命令
   const isApprovalCommand = /^\/(approve|deny)$/i.test(content.trim())
 
-  if ((!content && pendingAttachments.value.length === 0) || !selectedAgentId.value || blockingPrompt.value) return
+  if ((!content && pendingAttachments.value.length === 0)
+      || !selectedAgentId.value
+      || blockingPrompt.value
+      || workerConversationReadOnly.value) return
   // 不再阻止运行中发送 — useChat 会自动走 interrupt/queue 路径
 
   // 拦截 /approve 和 /deny 命令 —— 通过 SSE 流发送（和普通消息相同通道）
@@ -1950,6 +2232,28 @@ async function handleSendMessage(content: string) {
     return
   }
 
+  if (!isApprovalCommand && !pendingAttachments.value.length) {
+    const gate = {
+      canOperate: canOperateTroubleshooting.value,
+      suppressed: isTsIntentSuppressed(),
+      intakeActive: tsIntakeActive.value,
+    }
+    if (shouldAutoStartTroubleshootingIntake(content, gate)) {
+      await runTroubleshootingIntakeTurn(content)
+      return
+    }
+    if (shouldOfferTroubleshootingIntake(content, gate)) {
+      tsIntentOffer.value = { text: content.trim() }
+      inputText.value = ''
+      chatInputRef.value?.clear?.()
+      return
+    }
+  }
+
+  await continueNormalChatSend(content)
+}
+
+async function continueNormalChatSend(content: string) {
   if (!currentConversationId.value) {
     currentConversationId.value = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
   }
@@ -2011,7 +2315,8 @@ function handleStopStream() {
 }
 
 async function handleRegenerate(message: Message) {
-  if (isGenerating.value || !currentConversationId.value || !selectedAgentId.value) return
+  if (workerConversationReadOnly.value
+    || isGenerating.value || !currentConversationId.value || !selectedAgentId.value) return
   const idx = messages.value.indexOf(message)
   if (idx >= 0) {
     // The server drops the trailing assistant block and reuses the persisted
@@ -2035,7 +2340,7 @@ async function handleRegenerate(message: Message) {
 }
 
 async function handleRewind(message: Message) {
-  if (isGenerating.value || !currentConversationId.value) return
+  if (workerConversationReadOnly.value || isGenerating.value || !currentConversationId.value) return
   const idx = messages.value.indexOf(message)
   if (idx < 0) return
   const count = messages.value.length - idx
@@ -2067,6 +2372,10 @@ async function handleRewind(message: Message) {
 }
 
 function sendSuggestion(text: string) {
+  if (text === TS_LAUNCH_SUGGESTION) {
+    openConversationIntake()
+    return
+  }
   inputText.value = text
   handleSendMessage(text)
 }
@@ -2163,6 +2472,7 @@ function resetStreamingState() {
 
 // ============ 附件处理 ============
 async function handleFileSelect(files: File[]) {
+  if (workerConversationReadOnly.value) return
   if (!currentConversationId.value) {
     newConversation()
   }
@@ -2601,6 +2911,77 @@ function handleCodeCopy(e: MouseEvent) {
 .header-btn:hover {
   border-color: var(--mc-danger);
   color: var(--mc-danger);
+}
+
+.header-ts-launch {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--mc-border);
+  border-radius: 10px;
+  color: var(--mc-text-primary);
+  background: var(--mc-panel-raised);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+
+.header-ts-launch:hover {
+  border-color: var(--mc-primary);
+  color: var(--mc-primary);
+}
+
+.ts-intent-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 16px 10px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--mc-primary) 28%, var(--mc-border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--mc-primary) 8%, var(--mc-bg));
+}
+.ts-intent-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+.ts-intent-copy b {
+  font-size: 13px;
+}
+.ts-intent-copy span {
+  color: var(--mc-text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.ts-intent-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.ts-intent-actions .btn-primary,
+.ts-intent-actions .btn-secondary {
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ts-intent-actions .btn-primary {
+  border: none;
+  color: #fff;
+  background: var(--mc-primary);
+}
+.ts-intent-actions .btn-secondary {
+  border: 1px solid var(--mc-border);
+  color: var(--mc-text-primary);
+  background: var(--mc-bg);
 }
 
 .model-prompt {

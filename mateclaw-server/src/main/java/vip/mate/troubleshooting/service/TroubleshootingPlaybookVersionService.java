@@ -79,6 +79,43 @@ public class TroubleshootingPlaybookVersionService {
     }
 
     /**
+     * Resolves the system dimension only when one live authority exactly
+     * matches service + error code in the same workspace.
+     */
+    public Optional<String> uniqueActiveSystemForExactRoute(
+            long workspaceId,
+            String service,
+            String errorCode) {
+        validateWorkspace(workspaceId);
+        List<String> systems = mapper.listActiveSystemsForExactRoute(
+                workspaceId,
+                required(service, "service"),
+                required(errorCode, "errorCode"));
+        return systems.size() == 1
+                ? Optional.of(systems.getFirst())
+                : Optional.empty();
+    }
+
+    /**
+     * Resolves the system dimension from the service alone, for alerts that
+     * carry no error code.
+     *
+     * <p>Same discipline as {@link #uniqueActiveSystemForExactRoute}: only a
+     * single live authority may answer. Zero or several matches stay empty so
+     * Intake asks the reporter.</p>
+     */
+    public Optional<String> uniqueActiveSystemForService(
+            long workspaceId,
+            String service) {
+        validateWorkspace(workspaceId);
+        List<String> systems = mapper.listActiveSystemsForService(
+                workspaceId, required(service, "service"));
+        return systems.size() == 1
+                ? Optional.of(systems.getFirst())
+                : Optional.empty();
+    }
+
+    /**
      * Reads one immutable version by its own identity, at whatever version it is.
      *
      * <p>Unlike {@link #findByRef} this does not demand a known version number:
@@ -472,7 +509,12 @@ public class TroubleshootingPlaybookVersionService {
                 source.evidenceRequests(),
                 source.anomalyCriteria(),
                 source.diagnosisRules(),
-                source.actions());
+                source.actions(),
+                // Dropping the declared triggers here would silently make every
+                // approved scenario Playbook unreachable by symptom routing:
+                // the reviewer approves a contract that answers 「URL慢请求」and
+                // the live version answers nothing.
+                source.symptomTriggers());
     }
 
     private void validateWorkspace(long workspaceId) {

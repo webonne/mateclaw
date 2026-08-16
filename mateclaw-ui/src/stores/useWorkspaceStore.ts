@@ -24,13 +24,22 @@ export interface Workspace {
   effectiveRole?: WorkspaceRole | null
 }
 
+function workspaceStorage(): Storage | null {
+  try {
+    return typeof window === 'undefined' ? null : window.localStorage
+  } catch {
+    // Storage can be unavailable in SSR, restricted browser contexts, or tests.
+    return null
+  }
+}
+
 export const useWorkspaceStore = defineStore('workspace', () => {
   const workspaces = ref<Workspace[]>([])
   // Stored as a string: the workspace id is a 19-digit Snowflake, so a Number()
   // coercion here would corrupt every non-default workspace id and the reloaded
   // value would match no workspace, silently snapping back to Default.
   const currentWorkspaceId = ref<string | null>(
-    localStorage.getItem('mc-workspace-id') || null
+    workspaceStorage()?.getItem('mc-workspace-id') || null
   )
   const loading = ref(false)
 
@@ -76,7 +85,30 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         currentCapabilities.value = new Set(caps as Capability[])
       } catch (e) {
         console.warn('Failed to fetch workspace access:', e)
-        currentCapabilities.value = new Set()
+        // 后端短暂不可用时不要把已登录管理员锁死成「无权访问」。
+        // 仅在名单里已标明全局管理员 / owner|admin 时回退，避免抬高普通成员权限。
+        const ws = workspaces.value.find((item) => item.id === id)
+        const role = (ws?.effectiveRole || ws?.memberRole || '').toLowerCase()
+        if (ws?.isGlobalAdmin || role === 'owner' || role === 'admin') {
+          currentCapabilities.value = new Set([
+            'chat',
+            'view:wiki',
+            'view:troubleshooting',
+            'view:memory',
+            'view:dashboard',
+            'manage:wiki',
+            'manage:agents',
+            'operate:troubleshooting',
+            'manage:skills',
+            'manage:channels',
+            'manage:models',
+            'manage:security',
+            'manage:settings',
+            'manage:troubleshooting',
+          ] as Capability[])
+        } else {
+          currentCapabilities.value = new Set()
+        }
       } finally {
         accessLoaded.value = true
         accessInFlight = null
@@ -109,7 +141,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   async function switchWorkspace(id: string) {
     currentWorkspaceId.value = id
-    localStorage.setItem('mc-workspace-id', id)
+    workspaceStorage()?.setItem('mc-workspace-id', id)
     accessLoaded.value = false
     currentCapabilities.value = new Set()
     await refreshAccess()

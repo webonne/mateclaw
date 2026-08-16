@@ -7,25 +7,34 @@ import type {
   CaptureEvaluationSampleRequest,
   CaptureRecordedReplayEvaluationSampleRequest,
   ClosureOutcome,
+  ConversationTurnRequest,
+  ConversationTurnResult,
   CreateDeploymentTopologyScenarioRequest,
   DeclareEvidenceRouteRequest,
+  DeclareEvidenceContractRequest,
   DeclareObservabilityAssetRequest,
   DeploymentTopologyAssetSummary,
   DeploymentTopologyImportResult,
   DeploymentTopologySopResult,
+  DeclareTroubleshootingPilotPlanRequest,
   DiagnosisDerivation,
   DiagnosisExperienceProjection,
   DiagnosisSummary,
   EvidenceChainPreviewRequest,
   EvidenceEvaluationSample,
   EvidenceEvaluationSampleLedger,
+  EvaluationNorthStarComparison,
   EvidenceQueryCatalog,
   EvidenceContractTrial,
   EvidenceContractTrialRequest,
   EvidenceRouteDeclaration,
+  EvidenceSettingsUpdate,
+  EvidenceSettingsView,
   FinalizeEvaluationSampleReferenceRequest,
   GuanceEvidenceAcceptanceView,
   GuanceEvidenceReadiness,
+  OpenDiscoveryReadiness,
+  OpenDiscoveryAgentBinding,
   GuanceEvidenceSpinePreview,
   GuanceEvidenceValidationReport,
   GuanceRecordingTargetCatalogView,
@@ -43,6 +52,8 @@ import type {
   KnowledgeReviewState,
   ManualPlaybookReplayAttestation,
   ObservabilityAsset,
+  EvidenceContractCatalog,
+  EvidenceContractView,
   ObservabilityAssetCatalog,
   RecordedReplayEvaluationCapability,
   RunBaselineEvaluationRequest,
@@ -55,6 +66,7 @@ import type {
   StoredBaselineEvaluationRun,
   StoredDiagnosis,
   StoredEvidenceEvaluationSample,
+  TroubleshootingPilotPlan,
   TopologyProbeEvidenceRun,
 } from './troubleshooting-contracts'
 
@@ -63,6 +75,10 @@ export const createTroubleshootingApi = (http: AxiosInstance) => ({
   /** Report an incident. A retry inside the dedup bucket returns `created: false`. */
   report: (data: IncidentReportRequest) =>
     http.post<StoredDiagnosis>('/troubleshooting/incidents', data),
+
+  /** Multi-turn Web conversation intake; READY returns the same Diagnosis as WeCom. */
+  conversationTurn: (data: ConversationTurnRequest) =>
+    http.post<ConversationTurnResult>('/troubleshooting/conversation/turns', data),
 
   /** Opens one exact approved scenario without claiming a cause. */
   createScenarioDiagnosis: (scenarioKey: string, data: ScenarioDiagnosisRequest) =>
@@ -115,6 +131,55 @@ export const createTroubleshootingApi = (http: AxiosInstance) => ({
   evidenceReadiness: (params: { system: string; service: string }) =>
     http.get<GuanceEvidenceReadiness>('/troubleshooting/evidence/readiness', { params }),
 
+  /** Secret-free OPEN_DISCOVERY / miss-path readiness; does not call a model. */
+  openDiscoveryReadiness: (params?: { system?: string }) =>
+    http.get<OpenDiscoveryReadiness>('/troubleshooting/open-discovery/readiness', { params }),
+
+  /** Current workspace digital-employee binding for OPEN_DISCOVERY. */
+  openDiscoveryAgentBinding: () =>
+    http.get<OpenDiscoveryAgentBinding>('/troubleshooting/open-discovery/agent-binding'),
+
+  /** Bind a digital employee as the OPEN_DISCOVERY executor. */
+  bindOpenDiscoveryAgent: (data: { agentId: number | string; prepareEvidenceTool?: boolean }) =>
+    http.put<OpenDiscoveryAgentBinding>('/troubleshooting/open-discovery/agent-binding', {
+      // Preserve 64-bit Snowflake IDs exactly; Jackson accepts the decimal string for Long.
+      agentId: String(data.agentId),
+      prepareEvidenceTool: data.prepareEvidenceTool ?? true,
+    }),
+
+  /** Clear workspace binding and fall back to process config agent-id. */
+  clearOpenDiscoveryAgentBinding: () =>
+    http.delete<OpenDiscoveryAgentBinding>('/troubleshooting/open-discovery/agent-binding'),
+
+  /** Which evidence sources this workspace has switched on, with the key masked. */
+  evidenceSettings: () =>
+    http.get<EvidenceSettingsView>('/troubleshooting/evidence-settings'),
+
+  /**
+   * Saves the workspace's evidence source settings.
+   *
+   * <p>`guanceApiKey` is three-valued and the distinction matters: omit it to
+   * keep the stored credential (the form cannot show it, so an owner editing
+   * only the URL has nothing to resend), pass `''` to clear it, pass a value to
+   * replace it. `expectedVersion` must echo the version that was read, so a
+   * concurrent edit fails instead of silently overwriting someone's key.
+   */
+  saveEvidenceSettings: (data: EvidenceSettingsUpdate) =>
+    http.put<EvidenceSettingsView>('/troubleshooting/evidence-settings', data),
+
+  /** Latest immutable first-wave pilot declaration for this Workspace. */
+  pilotPlan: () =>
+    http.get<TroubleshootingPilotPlan>('/troubleshooting/pilot-plan'),
+
+  /** Appends a new pilot revision; member ids remain exact decimal strings. */
+  declarePilotPlan: (data: DeclareTroubleshootingPilotPlanRequest) =>
+    http.put<TroubleshootingPilotPlan>('/troubleshooting/pilot-plan', {
+      ...data,
+      secondLineUserId: String(data.secondLineUserId),
+      thirdLineUserId: String(data.thirdLineUserId),
+      sourceOwnerUserId: String(data.sourceOwnerUserId),
+    }),
+
   /** Scenario-oriented contract directory; reads configuration without querying a source. */
   evidenceCatalog: () => http.get<EvidenceQueryCatalog>(
     '/troubleshooting/evidence/catalog',
@@ -148,6 +213,21 @@ export const createTroubleshootingApi = (http: AxiosInstance) => ({
   observabilityAssets: () => http.get<ObservabilityAssetCatalog>(
     '/troubleshooting/evidence/assets',
   ),
+
+  /** Method library: deployment + workspace contracts (list hides query templates). */
+  evidenceContracts: () => http.get<EvidenceContractCatalog>(
+    '/troubleshooting/evidence/contracts',
+  ),
+
+  /** Admin detail includes query template for editing. */
+  evidenceContractDetail: (contractRef: string) =>
+    http.get<EvidenceContractView>(
+      `/troubleshooting/evidence/contracts/${encodeURIComponent(contractRef)}`,
+    ),
+
+  /** Adds the next immutable workspace contract revision. */
+  declareEvidenceContract: (data: DeclareEvidenceContractRequest) =>
+    http.put<EvidenceContractView>('/troubleshooting/evidence/contracts', data),
 
   /** Adds the next immutable asset revision; existing versions remain auditable. */
   declareObservabilityAsset: (data: DeclareObservabilityAssetRequest) =>
@@ -245,6 +325,12 @@ export const createTroubleshootingApi = (http: AxiosInstance) => ({
   evaluationSamples: (params?: { diagnosisId?: string; limit?: number }) =>
     http.get<EvidenceEvaluationSampleLedger>(
       '/troubleshooting/evaluation-samples', { params },
+    ),
+
+  /** Human historical time next to the shadow machine baseline; no savings verdict. */
+  evaluationNorthStar: (params?: { diagnosisId?: string; limit?: number }) =>
+    http.get<EvaluationNorthStarComparison>(
+      '/troubleshooting/evaluation-samples/north-star', { params },
     ),
 
   /** Stores human-authored intent keys; closure outcome is derived by the server. */

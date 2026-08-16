@@ -1,27 +1,117 @@
 import { describe, expect, it } from 'vitest'
+import routerSource from '../../../router/index.ts?raw'
+import troubleshootingLayoutSource from '../TroubleshootingLayout.vue?raw'
 import {
   WORKBENCH_CAPABILITY_GROUPS,
+  WORKBENCH_PRIMARY_CAPABILITIES,
   legacyEvidenceSynthesisLocation,
+  normalizeEvidenceSetupSection,
   normalizeWorkbenchOverlayCapability,
+  observabilityAssetsLocation,
+  pilotMemberReturnPath,
+  pilotMemberSettingsLocation,
   safeTroubleshootingReturnPath,
+  t7OwnerContractLocation,
   workbenchOverlayLocation,
 } from '../workbenchCapabilityMenu'
 
 describe('troubleshooting secondary navigation information architecture', () => {
-  it('keeps data-source validation inside the evidence setup navigation', () => {
-    const items = WORKBENCH_CAPABILITY_GROUPS.flatMap(group => group.items)
+  it('keeps daily navigation small and moves specialist controls under more configuration', () => {
+    const groupedItems = WORKBENCH_CAPABILITY_GROUPS.flatMap(group => group.items)
+    const items = [...WORKBENCH_PRIMARY_CAPABILITIES, ...groupedItems]
 
     expect(WORKBENCH_CAPABILITY_GROUPS.map(group => group.label)).toEqual([
-      '配置与接入',
+      '更多配置',
       '复盘与沉淀',
     ])
-    expect(items.map(item => item.command)).toEqual([
-      'observability-assets',
+    expect(WORKBENCH_PRIMARY_CAPABILITIES.map(item => ({
+      key: item.key,
+      label: item.label,
+      section: item.section,
+    }))).toEqual([
+      { key: 'evidence-modules', label: '接入系统', section: 'modules' },
+      { key: 't7-owner-contract', label: '标准查登记', section: undefined },
+    ])
+    expect(items.map(item => item.key)).toEqual([
+      'evidence-modules',
+      't7-owner-contract',
+      'evidence-tools',
+      'evidence-source',
       'playbooks',
       'ledger',
       'case-knowledge',
     ])
+    expect(items.filter(item => item.command === 'observability-assets').map(item => ({
+      section: item.section,
+      label: item.label,
+    }))).toEqual([
+      { section: 'modules', label: '接入系统' },
+      { section: 'tools', label: '取证方法' },
+      { section: 'source', label: '数据连接' },
+    ])
+    expect(items.map(item => item.description)).toEqual([
+      '登记系统模块，并在模块里选择取证方法',
+      '登记首批 20 条重点故障怎么查（准备材料，不等于验收）',
+      '维护方法库（可设通用或指定系统/模块），再在接入系统里选用',
+      '检查观测云能否正常读取',
+      '场景、步骤与判断标准',
+      '用真实样本验证效果',
+      '沉淀已解决的故障',
+    ])
+    expect(items.find(item => item.command === 't7-owner-contract')?.requiredCapability).toBe(
+      'view:troubleshooting',
+    )
     expect(items.find(item => item.command === 'guance')).toBeUndefined()
+    expect(items.find(item => item.command === 't7-owner-contract')?.label).toBe('标准查登记')
+  })
+
+  it('keeps each evidence setup menu addressable without losing the return target', () => {
+    expect(normalizeEvidenceSetupSection(undefined)).toBe('modules')
+    expect(normalizeEvidenceSetupSection('tools')).toBe('tools')
+    expect(normalizeEvidenceSetupSection('source')).toBe('source')
+    expect(normalizeEvidenceSetupSection('unknown')).toBe('modules')
+
+    expect(observabilityAssetsLocation(
+      undefined,
+      '/troubleshooting?view=detail&diagnosisId=diag-1',
+      'tools',
+    )).toEqual({
+      path: '/troubleshooting/observability-assets',
+      query: {
+        section: 'tools',
+        returnTo: '/troubleshooting?view=detail&diagnosisId=diag-1',
+      },
+    })
+
+    expect(t7OwnerContractLocation('/troubleshooting?view=detail&diagnosisId=diag-1')).toEqual({
+      path: '/troubleshooting/t7-owner-contract',
+      query: {
+        returnTo: '/troubleshooting?view=detail&diagnosisId=diag-1',
+      },
+    })
+
+    expect(t7OwnerContractLocation(
+      '/troubleshooting?view=list&capability=ledger&pilotSetup=1',
+    )).toEqual({
+      path: '/troubleshooting/t7-owner-contract',
+      query: {
+        returnTo: '/troubleshooting?view=list&capability=ledger&pilotSetup=1',
+      },
+    })
+  })
+
+  it('keeps advanced and learning controls collapsed while opening active deep links', () => {
+    expect(troubleshootingLayoutSource).toContain('WORKBENCH_PRIMARY_CAPABILITIES')
+    expect(troubleshootingLayoutSource).toContain('aria-expanded="capabilityGroupExpanded(group)"')
+    expect(troubleshootingLayoutSource).toContain('v-show="capabilityGroupExpanded(group)"')
+    expect(troubleshootingLayoutSource).toContain('return capabilityGroupActive(group) || manuallyExpandedGroups.value.has(group.key)')
+  })
+
+  it('maps legacy catalog tabs to the matching setup section', () => {
+    expect(routerSource).toContain("tab === 'contracts' || tab === 'routes'")
+    expect(routerSource).toContain("tab === 'acceptance'")
+    expect(routerSource).toContain("delete query.tab")
+    expect(routerSource).toContain("query: { ...query, section }")
   })
 
   it('redirects the legacy synthesis deep link into diagnosis evaluation', () => {
@@ -60,6 +150,31 @@ describe('troubleshooting secondary navigation information architecture', () => 
     expect(safeTroubleshootingReturnPath('/troubleshooting/evidence-catalog?tab=routes')).toBeNull()
     expect(safeTroubleshootingReturnPath('/troubleshooting/sops')).toBeNull()
     expect(safeTroubleshootingReturnPath('/troubleshooting-other')).toBeNull()
+  })
+
+  it('keeps the pilot member hand-off local and returns to the expanded setup', () => {
+    expect(pilotMemberSettingsLocation(
+      '/troubleshooting?view=list&capability=ledger&pilotSetup=1',
+    )).toEqual({
+      path: '/settings/members',
+      query: {
+        source: 'troubleshooting-pilot',
+        returnTo: '/troubleshooting?view=list&capability=ledger&pilotSetup=1',
+      },
+    })
+    expect(pilotMemberSettingsLocation('https://example.com')).toEqual({
+      path: '/settings/members',
+      query: {
+        source: 'troubleshooting-pilot',
+        returnTo: '/troubleshooting?view=list&capability=ledger&pilotSetup=1',
+      },
+    })
+    expect(pilotMemberReturnPath(
+      'troubleshooting-pilot',
+      '/troubleshooting?view=list&capability=ledger&pilotSetup=1',
+    )).toBe('/troubleshooting?view=list&capability=ledger&pilotSetup=1')
+    expect(pilotMemberReturnPath('other', '/troubleshooting?view=list')).toBeNull()
+    expect(pilotMemberReturnPath('troubleshooting-pilot', 'https://example.com')).toBeNull()
   })
 
   it('keeps the legacy Guance overlay deep link only as a compatibility action', () => {

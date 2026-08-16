@@ -1,7 +1,7 @@
 <template>
   <aside class="queue-panel">
     <header class="queue-head">
-      <div><span class="eyebrow">MateClaw</span><h2>排障队列</h2></div>
+      <div><h2>排障队列</h2></div>
       <div class="queue-head-actions">
         <el-tag size="small" type="info" round>{{ rows.length }}</el-tag>
         <WorkbenchViewSwitch mode="QUEUE" compact @change="$emit('switch-view')" />
@@ -73,7 +73,7 @@
       </button>
       <div v-if="!loading && !rows.length" class="queue-empty">
         <b>还没有诊断记录</b>
-        <p>从正式入口选择排障场景；通用事件会进入 Diagnosis 主链，专项场景遵守各自能力边界。</p>
+        <p>有告警？点「发起排障」填表，或在表单里改用对话补问。生成排障单后进入详情继续。</p>
         <el-button
           v-if="canOperate || canManage"
           size="small"
@@ -84,8 +84,6 @@
         <code v-else>需要 operate:troubleshooting 权限</code>
       </div>
     </div>
-
-    <footer class="queue-foot"><span>正式入口 · 真实 API</span></footer>
   </aside>
 </template>
 

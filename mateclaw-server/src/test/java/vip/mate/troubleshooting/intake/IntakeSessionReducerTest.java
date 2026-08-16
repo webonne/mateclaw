@@ -69,7 +69,7 @@ class IntakeSessionReducerTest {
         assertNull(ready.errorCode(), "an omitted error code must remain unknown");
         assertTrue(ready.missingFields().isEmpty());
         String prompt = IntakeDecision.from(ready, false, false).prompt();
-        assertTrue(prompt.contains("已进入异步只读调查队列"));
+        assertTrue(prompt.contains("正在生成排障单"));
         assertTrue(prompt.contains("不会执行任何生产变更"));
     }
 
@@ -91,7 +91,180 @@ class IntakeSessionReducerTest {
         assertNull(session.occurredAt());
         assertEquals(List.of("occurredAt"), session.missingFields());
         assertTrue(IntakeDecision.from(session, false, false).prompt()
-                .contains("2026-07-29 10:05:00"));
+                .contains("2026-08-12 16:36:00"));
+    }
+
+    @Test
+    void pastedIcareDialProbeAlertBecomesReadyWithoutManualFieldTranscription() {
+        String alert = """
+                sf-icare-app-虚机-拨测检测异常
+                ■【重要】2026-08-12 16:36:00 (r/95b771)
+                业务系统：深信服新ICare系统-邹汶达
+                告警分组：ICARE告警
+                告警级别：error
+                监控项：sf-icare-app-虚机-拨测检测异常，请及时关注处理
+                告警URL：http://icarenew.sangfor.com/index.html
+                """;
+        IntakeSession session = reducer.start(
+                "intake-icare",
+                envelope("msg-icare", alert, List.of(), FIRST_MESSAGE_AT));
+
+        assertEquals(IntakeSessionStatus.READY, session.status());
+        assertEquals("深信服新ICare系统-邹汶达", session.system());
+        assertEquals("sf-icare-app", session.service());
+        assertEquals("未知", session.customerRef());
+        assertEquals(Instant.parse("2026-08-12T08:36:00Z"), session.occurredAt());
+        assertTrue(session.symptom().contains("sf-icare-app"));
+        assertTrue(session.missingFields().isEmpty());
+        assertTrue(IntakeDecision.from(session, false, false).prompt().contains("正在生成排障单"));
+    }
+
+    @Test
+    void pastedCsdpAlertExtractsTheExplicitBracketedErrorCode() {
+        String alert = """
+                客服数字化(WECHAT)-【ITGW访问失败】-事件
+                ■【紧急】2026-08-07 17:12:00 (r/e4d3f5)
+                集群：sz3-s-k8s
+                服务：csdp-wechat
+                数量：6
+                异常：ITGW访问失败【904003】
+                说明：异常事件
+                """;
+
+        IntakeSession session = reducer.start(
+                "intake-itgw",
+                envelope("msg-itgw", alert, List.of(), FIRST_MESSAGE_AT));
+
+        assertEquals(IntakeSessionStatus.AWAITING_INPUT, session.status());
+        assertEquals("ITGW访问失败【904003】", session.symptom());
+        assertEquals("csdp-wechat", session.service());
+        assertEquals("未知", session.customerRef());
+        assertEquals(Instant.parse("2026-08-07T09:12:00Z"), session.occurredAt());
+        assertEquals("904003", session.errorCode(),
+                "告警已明确给出括号错误码时，应结构化提取而不是进入无码 Agent 路径");
+        assertEquals(List.of("system"), session.missingFields(),
+                "服务告警缺少系统字段时只应追问系统，不能猜一个错误码路由系统");
+    }
+
+    @Test
+    void pastedCsdpAlertExtractsAFourDigitBracketedBusinessCode() {
+        String alert = """
+                客服数字化(WECHAT)-【客户-搜索用户名超限制】-事件
+                ■【紧急】2026-08-14 13:06:00 (r/93bf1d)
+                集群：sz3-s-k8s
+                服务：csdp-wechat
+                数量：4
+                异常：客户-搜索用户名超限制【1009】
+                说明：异常事件
+                """;
+
+        IntakeSession session = reducer.start(
+                "intake-1009",
+                envelope("msg-1009", alert, List.of(), FIRST_MESSAGE_AT));
+
+        assertEquals(IntakeSessionStatus.AWAITING_INPUT, session.status());
+        assertEquals("客户-搜索用户名超限制【1009】", session.symptom());
+        assertEquals("1009", session.errorCode(),
+                "CSDP 已有 4 位业务码；超限制不是失败二字，但不能因此丢掉括号里的码");
+        assertEquals("csdp-wechat", session.service());
+        assertEquals("未知", session.customerRef());
+        assertEquals(Instant.parse("2026-08-14T05:06:00Z"), session.occurredAt());
+        assertEquals(List.of("system"), session.missingFields());
+    }
+
+    @Test
+    void conflictingBracketedErrorCodesAreNotGuessed() {
+        IntakeSession session = reducer.start(
+                "intake-conflicting-codes",
+                envelope(
+                        "msg-conflicting-codes",
+                        "异常：ITGW访问失败【904003】\n错误：下游返回【701022】",
+                        List.of(),
+                        FIRST_MESSAGE_AT));
+
+        assertNull(session.errorCode(),
+                "同一告警出现多个候选错误码时必须保持未知，等待显式确认");
+    }
+
+    @Test
+    void bracketedPeopleServicesAndSeverityAreNeverPromotedToAnErrorCode() {
+        for (String text : List.of(
+                "问题负责人【Alice】",
+                "现象：调用服务【csdp-wechat】超时",
+                "异常等级【P01】",
+                "Error: timeout",
+                "现象：接口返回订单号【123456】",
+                "异常：下游返回用户ID【123456】")) {
+            IntakeSession session = reducer.start(
+                    "intake-non-code-" + text.hashCode(),
+                    envelope("msg-non-code-" + text.hashCode(), text, List.of(), FIRST_MESSAGE_AT));
+
+            assertNull(session.errorCode(), text + " 不是显式错误码，不能进入确定性路由");
+        }
+    }
+
+    @Test
+    void explicitErrorCodeAliasesRemainSupported() {
+        for (String label : List.of("error_code", "error-code", "error code", "错误码")) {
+            IntakeSession session = reducer.start(
+                    "intake-code-alias-" + label.hashCode(),
+                    envelope(
+                            "msg-code-alias-" + label.hashCode(),
+                            label + ": 903001",
+                            List.of(),
+                            FIRST_MESSAGE_AT));
+
+            assertEquals("903001", session.errorCode(),
+                    label + " 是明确的错误码标签，必须保持兼容");
+        }
+    }
+
+    @Test
+    void explicitErrorCodeAndSymptomCodeConflictRequiresClarification() {
+        IntakeSession session = reducer.start(
+                "intake-code-conflict",
+                envelope(
+                        "msg-code-conflict",
+                        "error_code：701022\n异常：ITGW访问失败【904003】",
+                        List.of(),
+                        FIRST_MESSAGE_AT));
+
+        assertNull(session.errorCode(),
+                "显式错误码和异常括号码不一致时，不能任取一个作为权威路由");
+    }
+
+    @Test
+    void awaitingPromptShowsRecognizedFieldsInsteadOfBlankAsk() {
+        IntakeSession session = reducer.start(
+                "intake-1",
+                envelope(
+                        "msg-1",
+                        "业务系统：CSDP\n现象: 消息发送失败\n发生时间: 2026-08-12 16:36:00",
+                        List.of(),
+                        FIRST_MESSAGE_AT));
+
+        assertEquals(IntakeSessionStatus.AWAITING_INPUT, session.status());
+        String prompt = IntakeDecision.from(session, false, false).prompt();
+        assertTrue(prompt.contains("已从告警中识别"));
+        assertTrue(prompt.contains("系统=CSDP"));
+        assertTrue(prompt.contains("还需要"));
+    }
+
+    @Test
+    void followUpPromptShowsAnExtractedErrorCodeInsteadOfHidingTheRouteFact() {
+        IntakeSession session = reducer.start(
+                "intake-code-visible",
+                envelope(
+                        "msg-code-visible",
+                        "服务：csdp-wechat\n异常：ITGW访问失败【904003】\n"
+                                + "发生时间：2026-08-07 17:12:00",
+                        List.of(),
+                        FIRST_MESSAGE_AT));
+
+        String prompt = IntakeDecision.from(session, false, false).prompt();
+
+        assertTrue(prompt.contains("错误码=904003"),
+                "需要补问系统时，也应把已识别的错误码展示给操作员复核");
     }
 
     @Test

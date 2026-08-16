@@ -20,6 +20,7 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -47,6 +48,15 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
     private final ObjectMapper objectMapper;
     private final EvidenceHttpTransport transport;
     private final WorkspaceObservabilityAssets workspaceAssets;
+    private final WorkspaceEvidenceContracts workspaceContracts;
+    /**
+     * Per-workspace overrides for enablement, endpoint and credential.
+     *
+     * <p>Nullable, and null in every unit test that predates the settings
+     * table. When absent the adapter behaves exactly as it did when these
+     * three values could only come from application.yml.
+     */
+    private final WorkspaceEvidenceSettingsService workspaceSettings;
     private final Clock clock;
     private final ConcurrentMap<ObservationKey, Instant> observations =
             new ConcurrentHashMap<>();
@@ -56,7 +66,8 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
             ObjectMapper objectMapper,
             EvidenceHttpTransport transport,
             Clock clock) {
-        this(config, objectMapper, transport, WorkspaceObservabilityAssets.NONE, clock);
+        this(config, objectMapper, transport, WorkspaceObservabilityAssets.NONE,
+                WorkspaceEvidenceContracts.NONE, clock);
     }
 
     GuanceEvidenceAdapter(
@@ -65,12 +76,72 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
             EvidenceHttpTransport transport,
             WorkspaceObservabilityAssets workspaceAssets,
             Clock clock) {
+        this(config, objectMapper, transport, workspaceAssets,
+                WorkspaceEvidenceContracts.NONE, clock);
+    }
+
+    GuanceEvidenceAdapter(
+            EvidenceProperties.Guance config,
+            ObjectMapper objectMapper,
+            EvidenceHttpTransport transport,
+            WorkspaceObservabilityAssets workspaceAssets,
+            WorkspaceEvidenceContracts workspaceContracts,
+            Clock clock) {
+        this(config, objectMapper, transport, workspaceAssets, workspaceContracts, null, clock);
+    }
+
+    GuanceEvidenceAdapter(
+            EvidenceProperties.Guance config,
+            ObjectMapper objectMapper,
+            EvidenceHttpTransport transport,
+            WorkspaceObservabilityAssets workspaceAssets,
+            WorkspaceEvidenceContracts workspaceContracts,
+            WorkspaceEvidenceSettingsService workspaceSettings,
+            Clock clock) {
         this.config = config == null ? new EvidenceProperties.Guance() : config;
         this.objectMapper = objectMapper;
         this.transport = transport;
         this.workspaceAssets = workspaceAssets == null
                 ? WorkspaceObservabilityAssets.NONE : workspaceAssets;
+        this.workspaceContracts = workspaceContracts == null
+                ? WorkspaceEvidenceContracts.NONE : workspaceContracts;
+        this.workspaceSettings = workspaceSettings;
         this.clock = clock == null ? Clock.systemUTC() : clock;
+    }
+
+    /**
+     * The enablement, endpoint and credential in force for one workspace.
+     *
+     * <p>Resolved on every call. Caching it would put back the restart that
+     * moving these values into the database was meant to remove.
+     */
+    EffectiveEvidenceSettings settingsFor(long workspaceId) {
+        if (workspaceSettings == null || workspaceId <= 0) {
+            return deploymentSettings();
+        }
+        try {
+            return workspaceSettings.effective(workspaceId);
+        } catch (RuntimeException lookupFailure) {
+            // Evidence is fail-closed: if the override cannot be read we fall
+            // back to the deployment values rather than inventing an
+            // enablement nobody configured.
+            log.warn("Workspace {} evidence settings lookup failed ({}); using deployment defaults",
+                    workspaceId, lookupFailure.getClass().getSimpleName());
+            return deploymentSettings();
+        }
+    }
+
+    private EffectiveEvidenceSettings deploymentSettings() {
+        // config::getApiKey rather than config.getApiKey(): an enablement or
+        // endpoint question must not read the credential.
+        return new EffectiveEvidenceSettings(
+                config.isEnabled(),
+                config.getBaseUrl(),
+                config::getApiKey,
+                config.isAllowInsecureHttp(),
+                false,
+                false,
+                EffectiveEvidenceSettings.Origin.DEPLOYMENT);
     }
 
     @Override
@@ -106,8 +177,21 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
         if (authorized == null) {
             return missing(request, "workspace asset or signal binding is not authorized");
         }
-        if (!baseConfigured()) {
+        EffectiveEvidenceSettings settings = settingsFor(workspaceId);
+        if (!baseConfigured(settings)) {
             return missing(request, "adapter disabled or base configuration missing");
+        }
+        if (workspaceSettings != null
+                && settings.origin() == EffectiveEvidenceSettings.Origin.WORKSPACE) {
+            // The endpoint is workspace-editable, so it is re-validated here
+            // and not only when it was saved: a hostname that resolved
+            // publicly at write time can resolve to a private address now.
+            try {
+                workspaceSettings.assertReachableEndpoint(settings.guanceBaseUrl());
+            } catch (SecurityException blocked) {
+                log.warn("Workspace {} Guance endpoint rejected by the outbound guard", workspaceId);
+                return missing(request, "Guance endpoint is not permitted by the outbound guard");
+            }
         }
 
         try {
@@ -117,15 +201,15 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
                     .map(template -> render(
                             template, request, incident, window, authorized.parameters()))
                     .toList();
-            String body = requestBody(queries, window, binding);
+            String body = requestBody(queries, window, binding, request.signalKind());
             log.debug("Dispatching Guance evidence signal {} via {}",
                     normalizeKey(request.signalKind()),
                     transport.getClass().getSimpleName());
             EvidenceHttpTransport.Response response = transport.postJson(
-                    queryUri(),
+                    queryUri(settings),
                     Map.of(
                             "Content-Type", "application/json",
-                            "DF-API-KEY", config.getApiKey()),
+                            "DF-API-KEY", settings.guanceApiKey()),
                     body,
                     timeout());
             log.debug("Guance evidence signal {} returned HTTP {}",
@@ -135,7 +219,7 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
             }
 
             Map<String, Object> observed = normalize(
-                    response.body(), binding, request);
+                    response.body(), binding, request, incident.service());
             if (observed.isEmpty()) {
                 return missingCanonical(request);
             }
@@ -173,7 +257,7 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
                     PLATFORM, EvidenceSourceHealth.Status.DEGRADED, false,
                     "explicit workspace asset authorization missing or invalid");
         }
-        if (!baseConfigured()) {
+        if (!baseConfigured(deploymentSettings())) {
             return new EvidenceSourceHealth(
                     PLATFORM, EvidenceSourceHealth.Status.DEGRADED, false,
                     "base URL, API key, or bindings missing");
@@ -189,25 +273,42 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
                 "authorized but not live-verified");
     }
 
-    private boolean baseConfigured() {
-        return config.isEnabled()
-                && present(config.getBaseUrl())
-                && present(config.getApiKey())
-                && config.getBindings() != null
-                && !config.getBindings().isEmpty();
+    private boolean baseConfigured(EffectiveEvidenceSettings settings) {
+        return settings.guanceCallable()
+                && ((config.getBindings() != null && !config.getBindings().isEmpty())
+                    || workspaceContracts != WorkspaceEvidenceContracts.NONE);
     }
 
+    /**
+     * Deployment-level enablement, for the source health probe.
+     *
+     * <p>{@code health()} describes the process, not a tenant, so it keeps
+     * reading the deployment values. Anything that knows which workspace it is
+     * acting for should call {@link #enabled(long)} instead.
+     */
     boolean enabled() {
         return config.isEnabled();
     }
 
+    boolean enabled(long workspaceId) {
+        return settingsFor(workspaceId).guanceEnabled();
+    }
+
     /** Checks the endpoint shape without opening a connection or reading credentials. */
     boolean endpointConfigured() {
-        if (!config.isEnabled() || !present(config.getBaseUrl())) {
+        return endpointConfigured(deploymentSettings());
+    }
+
+    boolean endpointConfigured(long workspaceId) {
+        return endpointConfigured(settingsFor(workspaceId));
+    }
+
+    private boolean endpointConfigured(EffectiveEvidenceSettings settings) {
+        if (!settings.guanceEnabled() || !present(settings.guanceBaseUrl())) {
             return false;
         }
         try {
-            queryUri();
+            queryUri(settings);
             return true;
         } catch (RuntimeException invalidEndpoint) {
             return false;
@@ -216,7 +317,16 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
 
     /** Must be called only after an exact workspace asset authorization was established. */
     GuanceEvidenceReadiness.CredentialState credentialState() {
-        return present(config.getApiKey())
+        return credentialState(deploymentSettings());
+    }
+
+    GuanceEvidenceReadiness.CredentialState credentialState(long workspaceId) {
+        return credentialState(settingsFor(workspaceId));
+    }
+
+    private GuanceEvidenceReadiness.CredentialState credentialState(
+            EffectiveEvidenceSettings settings) {
+        return present(settings.guanceApiKey())
                 ? GuanceEvidenceReadiness.CredentialState.CONFIGURED
                 : GuanceEvidenceReadiness.CredentialState.MISSING;
     }
@@ -277,14 +387,14 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
 
         String rawBindingRef = signalEntries.getFirst().getValue();
         String bindingRef = rawBindingRef == null ? "" : rawBindingRef.trim();
-        if (!safeReference(bindingRef) || config.getBindings() == null) {
+        if (!safeReference(bindingRef)) {
             return new SignalInspection(
                     GuanceEvidenceReadiness.SignalStatus.INVALID_BINDING,
                     "", null, "signal binding reference is invalid");
         }
         String normalizedBindingRef = normalizeKey(bindingRef);
         List<Map.Entry<String, EvidenceProperties.Binding>> bindingEntries =
-                config.getBindings().entrySet().stream()
+                resolvedBindings(asset.workspaceId()).entrySet().stream()
                         .filter(entry -> safeReference(entry.getKey())
                                 && normalizeKey(entry.getKey()).equals(normalizedBindingRef))
                         .toList();
@@ -384,7 +494,9 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
         if (asset.workspaceOwned()) {
             for (String name : assetParameterNames(binding)) {
                 String value = asset.parameters().get(name);
-                if (!safeReference(value)) {
+                // Admin-declared and never request-supplied, so this may name an
+                // observed object in any script; render() applies the same rule.
+                if (!EvidenceParameterValuePolicy.safeLabel(value)) {
                     return null;
                 }
                 parameters.put(name, value.trim());
@@ -415,22 +527,33 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
                 .filter(entry -> normalizeKey(entry.getKey()).equals(wantedSignal))
                 .toList();
         if (signalEntries.size() != 1
-                || !safeReference(signalEntries.getFirst().getValue())
-                || config.getBindings() == null) {
+                || !safeReference(signalEntries.getFirst().getValue())) {
             return null;
         }
-        return bindingFor(signalEntries.getFirst().getValue(), signalKind);
+        return bindingFor(
+                asset.workspaceId(), signalEntries.getFirst().getValue(), signalKind);
     }
 
     private EvidenceProperties.Binding bindingFor(
             String bindingReference,
             String signalKind) {
-        if (!safeReference(bindingReference) || config.getBindings() == null) {
+        return bindingFor(0L, bindingReference, signalKind);
+    }
+
+    private EvidenceProperties.Binding bindingFor(
+            long workspaceId,
+            String bindingReference,
+            String signalKind) {
+        if (!safeReference(bindingReference)) {
+            return null;
+        }
+        Map<String, EvidenceProperties.Binding> resolved = resolvedBindings(workspaceId);
+        if (resolved.isEmpty()) {
             return null;
         }
         String wantedBinding = normalizeKey(bindingReference);
         List<Map.Entry<String, EvidenceProperties.Binding>> bindingEntries =
-                config.getBindings().entrySet().stream()
+                resolved.entrySet().stream()
                 .filter(entry -> safeReference(entry.getKey())
                         && normalizeKey(entry.getKey()).equals(wantedBinding))
                 .toList();
@@ -443,6 +566,39 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
             return null;
         }
         return validBinding(signalKind, binding) ? binding : null;
+    }
+
+    private Map<String, EvidenceProperties.Binding> resolvedBindings(long workspaceId) {
+        Map<String, EvidenceProperties.Binding> merged = new LinkedHashMap<>();
+        Set<String> ambiguous = new LinkedHashSet<>();
+        if (config.getBindings() != null) {
+            Set<String> seen = new LinkedHashSet<>();
+            config.getBindings().forEach((key, value) -> {
+                if (!safeReference(key) || value == null) {
+                    return;
+                }
+                String normalized = normalizeKey(key);
+                if (!seen.add(normalized)) {
+                    ambiguous.add(normalized);
+                }
+                merged.put(normalized, value);
+            });
+        }
+        if (workspaceId > 0) {
+            Set<String> seen = new LinkedHashSet<>();
+            workspaceContracts.bindings(workspaceId).forEach((key, value) -> {
+                if (!safeReference(key) || value == null) {
+                    return;
+                }
+                String normalized = normalizeKey(key);
+                if (!seen.add(normalized)) {
+                    ambiguous.add(normalized);
+                }
+                merged.put(normalized, value);
+            });
+        }
+        ambiguous.forEach(merged::remove);
+        return merged;
     }
 
     private boolean hasUniqueAssetScope(EvidenceProperties.AssetBinding candidate) {
@@ -550,13 +706,14 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
     private String requestBody(
             List<String> queries,
             WindowRange window,
-            EvidenceProperties.Binding binding) throws Exception {
+            EvidenceProperties.Binding binding,
+            String signalKind) throws Exception {
         ObjectNode root = objectMapper.createObjectNode();
         var queryItems = root.putArray("queries");
         for (String query : queries) {
             ObjectNode querySpec = objectMapper.createObjectNode();
             querySpec.put("q", query);
-            addQueryOptions(querySpec, binding.getQueryOptions());
+            addQueryOptions(querySpec, binding.getQueryOptions(), window, signalKind);
             querySpec.putArray("timeRange")
                     .add(window.start().toEpochMilli())
                     .add(window.end().toEpochMilli());
@@ -589,19 +746,49 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
 
     private void addQueryOptions(
             ObjectNode querySpec,
-            EvidenceProperties.QueryOptions options) {
+            EvidenceProperties.QueryOptions options,
+            WindowRange window,
+            String signalKind) {
         if (options == null) {
             return;
         }
         querySpec.putArray("_funcList");
         querySpec.putArray("funcList");
         querySpec.put("maxPointCount", options.getMaxPointCount());
-        querySpec.put("interval", options.getInterval());
+        querySpec.put("interval", scalarInterval(options, window, signalKind));
         querySpec.put("align_time", options.isAlignTime());
         querySpec.putArray("sorder_by");
         querySpec.put("slimit", options.getSeriesLimit());
         querySpec.put("disable_sampling", options.isDisableSampling());
         querySpec.put("tz", options.getTimeZone().trim());
+    }
+
+    /**
+     * Aggregation interval for one query, in seconds.
+     *
+     * <p>Guance's {@code limit} bounds how many aggregation buckets the query
+     * scans, not how many rows it returns. A scalar contract sends
+     * {@code limit = maxRows + 1} to detect an over-budget result, so a fixed
+     * short interval silently narrows the query to the last few buckets: at
+     * {@code interval=10} with {@code limit=2} the request only ever looks at
+     * the last 20 seconds. Any probe reporting less often than that reads empty
+     * most of the time — measured against the live deployment, a 30s dial task
+     * returned a row in 1 of 6 attempts, and the contract then withheld the
+     * evidence as incomplete rather than reporting a source problem.
+     *
+     * <p>A scalar contract asks for the latest value <em>in the window</em>, so
+     * the window is the bucket. Row-set signals keep the configured interval:
+     * they need the individual points, not one aggregate.
+     */
+    private long scalarInterval(
+            EvidenceProperties.QueryOptions options,
+            WindowRange window,
+            String signalKind) {
+        if (CanonicalEvidenceSchema.isRowSet(signalKind)) {
+            return options.getInterval();
+        }
+        long span = Duration.between(window.start(), window.end()).toSeconds();
+        return Math.max(1L, span);
     }
 
     private boolean validQueryOptions(EvidenceProperties.QueryOptions options) {
@@ -649,12 +836,21 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
         values.put("window", window.expression());
         values.put("window_span", window.span());
 
-        Matcher matcher = EvidenceTemplateParameterPolicy.matcher(template);
+        // Omit {{?name}}...{{/name}} blocks when the value is absent/blank so
+        // reviewed contracts can still query with only runtime/asset context.
+        String expanded = EvidenceTemplateParameterPolicy.applyOptionalSections(
+                template,
+                key -> {
+                    Object raw = values.get(key);
+                    return raw != null && !String.valueOf(raw).trim().isEmpty();
+                });
+
+        Matcher matcher = EvidenceTemplateParameterPolicy.matcher(expanded);
         StringBuilder rendered = new StringBuilder();
         while (matcher.find()) {
             String key = normalizeKey(matcher.group(1));
             Object raw = values.get(key);
-            if (raw == null) {
+            if (raw == null || String.valueOf(raw).trim().isEmpty()) {
                 throw new IllegalArgumentException("missing query template value: " + key);
             }
             String value = String.valueOf(raw).trim();
@@ -665,6 +861,13 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
             } else if ("window_span".equals(key)) {
                 if (!WINDOW.matcher(value).matches() || value.startsWith("-")) {
                     throw new IllegalArgumentException("unsafe window span value");
+                }
+            } else if (assetParameters.containsKey(key)) {
+                // Asset-owned values are declared by a workspace admin, never by
+                // the browser or the model, so they may carry a human-authored
+                // name such as a Chinese CloudDial task.
+                if (!EvidenceParameterValuePolicy.safeLabel(value)) {
+                    throw new IllegalArgumentException("unsafe query template value: " + key);
                 }
             } else if (!SAFE_VALUE.matcher(value).matches()) {
                 throw new IllegalArgumentException("unsafe query template value: " + key);
@@ -700,7 +903,8 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
     private Map<String, Object> normalize(
             String responseBody,
             EvidenceProperties.Binding binding,
-            EvidenceRequest request) throws Exception {
+            EvidenceRequest request,
+            String serviceFallback) throws Exception {
         String signalKind = request.signalKind();
         JsonNode root = objectMapper.readTree(responseBody);
         if (root.path("code").asInt(-1) != 200 || !root.path("success").asBoolean(false)) {
@@ -736,7 +940,7 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
             }
             return normalizeRowSet(
                     populatedSeries.getFirst(), binding, signalKind,
-                    targetValue(request, "ps_id"));
+                    targetValue(request, "ps_id"), serviceFallback);
         }
         if (populatedDatasets.size() == 1) {
             return normalizeScalar(populatedDatasets.getFirst(), binding, signalKind);
@@ -871,7 +1075,8 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
             JsonNode series,
             EvidenceProperties.Binding binding,
             String signalKind,
-            String expectedPsId) {
+            String expectedPsId,
+            String serviceFallback) {
         JsonNode columns = series.path("columns");
         JsonNode values = series.path("values");
         if (!columns.isArray()
@@ -889,19 +1094,26 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
             Map<String, Object> canonical = canonicalRow(columns, row, binding, signalKind);
             rows.add(canonical);
         }
-        return normalizeCanonicalRows(rows, binding, signalKind, expectedPsId);
+        return normalizeCanonicalRows(rows, binding, signalKind, expectedPsId, serviceFallback);
     }
 
     private Map<String, Object> normalizeCanonicalRows(
             List<Map<String, Object>> rows,
             EvidenceProperties.Binding binding,
             String signalKind,
-            String expectedPsId) {
+            String expectedPsId,
+            String serviceFallback) {
         String psId = null;
         List<Map<String, Object>> entries = new ArrayList<>();
         for (Map<String, Object> sourceRow : rows) {
             Map<String, Object> canonical = withConstantFields(
                     sourceRow, binding, signalKind);
+            if (present(serviceFallback)
+                    && CanonicalEvidenceSchema.fields(signalKind).contains("service")) {
+                Map<String, Object> withService = new LinkedHashMap<>(canonical);
+                withService.putIfAbsent("service", serviceFallback.trim());
+                canonical = Map.copyOf(withService);
+            }
             if (!CanonicalEvidenceSchema.isValidRow(signalKind, canonical)) {
                 log.debug("Guance canonical trace row shape rejected: {}",
                         canonical.entrySet().stream()
@@ -1114,14 +1326,21 @@ public final class GuanceEvidenceAdapter implements EvidenceSourceAdapter {
         return latestCount == 1 ? latest : null;
     }
 
-    private URI queryUri() {
-        String base = config.getBaseUrl().trim().replaceAll("/+$", "");
+    /**
+     * Build the query endpoint.
+     *
+     * <p>The host half comes from {@code settings} because a workspace may own
+     * it; the path stays deployment-owned, since it names the Guance API
+     * contract this adapter was written against rather than a tenant choice.
+     */
+    private URI queryUri(EffectiveEvidenceSettings settings) {
+        String base = settings.guanceBaseUrl().trim().replaceAll("/+$", "");
         String path = present(config.getQueryPath())
                 ? config.getQueryPath().trim()
                 : "/api/v1/df/query_data_v1";
         URI uri = URI.create(base + (path.startsWith("/") ? path : "/" + path));
         if (!"https".equalsIgnoreCase(uri.getScheme())
-                && !(config.isAllowInsecureHttp() && "http".equalsIgnoreCase(uri.getScheme()))) {
+                && !(settings.guanceAllowInsecureHttp() && "http".equalsIgnoreCase(uri.getScheme()))) {
             throw new IllegalArgumentException(
                     "Guance base URL must use HTTPS unless insecure HTTP is explicitly allowed");
         }
